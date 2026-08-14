@@ -19,6 +19,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
+| `torch.ops.aten._conv_depthwise2d` | | | Spyre | In progress -- lowers to the native `depthwiseconv2dnative` window op, but the backend scheduler still rejects the generated descriptor. `conv2d` with `groups == C_in` is unaffected and keeps using `conv2d_via_bmm`. No `propagate_layouts` support yet |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |

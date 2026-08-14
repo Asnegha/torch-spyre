@@ -29,6 +29,7 @@ from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
     BATCH_MATMUL_FP8_OP,
+    DEPTHWISE_CONV2D_OP,
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
@@ -42,6 +43,7 @@ from .ir import (
     WaitWorkFallback,
 )
 from torch_spyre._C import get_elem_in_stick
+from .pass_utils import concretize_expr
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
@@ -806,6 +808,143 @@ def lower_avg_pool2d(
     # kernel_store_reduction reads op_info (pool constants) off node.data.op_info,
     # which only exists when the SpyreReduction is realized rather than fused into
     # a consumer.
+    result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.aten._conv_depthwise2d.default)
+def lower_conv_depthwise2d(
+    x,
+    weight,
+    kernel_size,
+    bias=None,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+):
+    """Lower depthwise conv2d to the native ``depthwiseconv2dnative`` window op.
+
+    A depthwise convolution is a per-channel windowed reduction: output channel
+    ``c`` reduces only over input channel ``c``'s ``K_h x K_w`` window.  That is
+    the same iteration-space shape as ``avgpoolfwd`` (batch, out-H, out-W,
+    channel, win-H, win-W), so this reuses the pool window machinery -- but with
+    two input tensors (activation and weight) and no averaging divisor.
+
+    Note this handles ``aten._conv_depthwise2d`` only.  ``torch.conv2d`` /
+    ``F.conv2d`` with ``groups == C_in`` trace to ``aten.convolution.default``
+    and keep going through ``conv2d_via_bmm_decomp``; they do not reach here.
+
+    TODO: this op has no ``propagate_layouts`` dispatch, so the weight operand
+    gets no layout constraint derived from the op's access pattern (the default
+    reduction path constrains ``args[0]`` only -- that is why ``batchmatmul`` has
+    its own ``_matmul_layouts``).  Device numerics are therefore not yet
+    trustworthy; a ``_depthwise_conv_layouts`` follow-up is needed.
+    """
+    kH, kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+    sH, sW = (stride, stride) if isinstance(stride, int) else stride
+    pH, pW = (padding, padding) if isinstance(padding, int) else padding
+    dH, dW = (dilation, dilation) if isinstance(dilation, int) else dilation
+
+    if len(x.get_size()) != 4:
+        raise Unsupported(
+            f"_conv_depthwise2d: expected 4D input, got {len(x.get_size())}D"
+        )
+
+    N, C_in, H_in, W_in = x.get_size()
+    w_size = weight.get_size()
+    if len(w_size) != 4:
+        raise Unsupported(f"_conv_depthwise2d: expected 4D weight, got {len(w_size)}D")
+
+    C_out, w_c_per_group, w_kh, w_kw = w_size
+    # A channel_multiplier > 1 makes one input channel feed several output
+    # channels, which the per-channel window datapath cannot express: the
+    # reduction's channel dim is shared by input and output.
+    if (
+        concretize_expr(C_out) != concretize_expr(C_in)
+        or concretize_expr(w_c_per_group) != 1
+    ):
+        raise Unsupported(
+            f"_conv_depthwise2d: expected weight (C_in, 1, K_h, K_w) with "
+            f"C_in={C_in}, got {list(w_size)} (channel_multiplier != 1 is "
+            "not supported)"
+        )
+    if concretize_expr(w_kh) != kH or concretize_expr(w_kw) != kW:
+        raise Unsupported(
+            f"_conv_depthwise2d: kernel_size {[kH, kW]} does not match weight "
+            f"spatial dims {[w_kh, w_kw]}"
+        )
+
+    if dH != 1 or dW != 1:
+        raise Unsupported(f"_conv_depthwise2d: dilation {[dH, dW]} not supported")
+
+    # Bias would need a (1, C, 1, 1) reshape to broadcast against the NCHW output
+    # with a stick-compatible layout.  conv2d_via_bmm_decomp does that with
+    # spyre.reshape_via_cpu at the FX level, which is not reachable from here;
+    # doing it at lowering time would mean hand-building the reshaped buffer.
+    # Reject for now -- callers can add the bias themselves.
+    if bias is not None:
+        raise Unsupported("_conv_depthwise2d with bias not yet supported")
+
+    # Mirrors lower_avg_pool2d: the window datapath has no tested padding
+    # semantics yet, and unlike avg_pool2d there is no in-tree Inductor
+    # decomposition to delegate to, so reject rather than silently mis-pad.
+    if pH > 0 or pW > 0:
+        raise Unsupported("_conv_depthwise2d with non-zero padding not yet supported")
+
+    # A 1-wide kernel leaves no pooling window on that axis, which the window
+    # datapath cannot express -- the DDL rejects a windowless window dimension.
+    # See the same guard in lower_avg_pool2d.
+    if kH == 1 or kW == 1:
+        raise Unsupported(
+            f"_conv_depthwise2d with kernel_size {[kH, kW]} not supported "
+            "(a 1-wide window has no window dimension)"
+        )
+
+    H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+    W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+
+    x.realize()
+    weight.realize()
+    x_loader = x.make_loader()
+    w_loader = weight.make_loader()
+
+    # No scaling_factor: unlike avgpool there is no 1/(kH*kW) normalization, so
+    # codegen must not emit an "nmap" constant for this op.
+    op_info = {
+        "constants": {
+            "kernel_h": kH,
+            "kernel_w": kW,
+            "stride_h": sH,
+            "stride_w": sW,
+            "pad_h": pH,
+            "pad_w": pW,
+        },
+    }
+
+    def inner_fn(index, reduction_index):
+        n, c, ho, wo = index
+        kh, kw = reduction_index
+        hi = ho * sH - pH + kh
+        wi = wo * sW - pW + kw
+        # Two-input reduction: returning a tuple makes the ops handler build a
+        # ReductionOp with two arguments (see SpyreKernelHandler.reduction),
+        # which kernel_store_reduction turns into an [input, kernel, output]
+        # TensorArg triple -- same shape as batchmatmul.
+        return (x_loader([n, c, hi, wi]), w_loader([c, 0, kh, kw]))
+
+    result = SpyreReduction.create(
+        reduction_type=DEPTHWISE_CONV2D_OP,
+        input_node=[x, weight],
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C_in, H_out, W_out],
+        reduction_ranges=[kH, kW],
+        op_info=op_info,
+    )
+    # Realize for the same reason as the pool: codegen reads op_info off
+    # node.data.op_info, which only exists on a realized SpyreReduction.
     result.realize()
     return result
 

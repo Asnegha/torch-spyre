@@ -4951,6 +4951,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
             },
         },
+        # Depthwise conv2d via the native depthwiseconv2dnative window op.
+        # Params are (x_nchw, weight, stride, padding); the test permutes x to
+        # NHWC.  Weight is always (C, 1, K_h, K_w) -- channel_multiplier == 1 is
+        # the only shape the lowering accepts.  Padding is 0 throughout: the
+        # lowering rejects non-zero padding (see lower_conv_depthwise2d).
+        ("test_depthwise_conv2d", "test_depthwise_conv2d_base"): {
+            "param_sets": {
+                # C=3: fewer channels than one stick (64), exercising the
+                # channel-recovery path in codegen.
+                "1x3x8x8_k2s2": (
+                    cached_randn((1, 3, 8, 8)),
+                    cached_randn((3, 1, 2, 2)),
+                    (2, 2),
+                    (0, 0),
+                ),
+                "1x3x24x24_k3s1": (
+                    cached_randn((1, 3, 24, 24)),
+                    cached_randn((3, 1, 3, 3)),
+                    (1, 1),
+                    (0, 0),
+                ),
+                # C=64: exactly one stick (stick-aligned).
+                "1x64x16x16_k3s1": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 1, 3, 3)),
+                    (1, 1),
+                    (0, 0),
+                ),
+                "1x64x16x16_k5s2": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 1, 5, 5)),
+                    (2, 2),
+                    (0, 0),
+                ),
+                # N=2: batch dim survives the iteration space.
+                "2x3x8x8_k2s2": (
+                    cached_randn((2, 3, 8, 8)),
+                    cached_randn((3, 1, 2, 2)),
+                    (2, 2),
+                    (0, 0),
+                ),
+            },
+        },
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -7116,6 +7159,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x_nhwc = x.permute(0, 2, 3, 1).contiguous()
         self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
+
+    def test_depthwise_conv2d_base(self, x, weight, stride, padding):
+        # Same NHWC handling as test_avg_pool2d_base: Spyre stores C as the stick
+        # (innermost) dim, so pass an NHWC-contiguous input and do the NHWC→NCHW
+        # permute inside fn so the compiled graph carries it.
+        #
+        # compare_with_pytorch (not compare_with_cpu) because
+        # aten::_conv_depthwise2d has no CPU kernel upstream — it is CUDA-only, so
+        # running the same fn on CPU to get a reference raises NotImplementedError.
+        # The reference is instead the mathematically equivalent grouped conv.
+        K_h, K_w = weight.shape[2], weight.shape[3]
+        C = x.shape[1]
+
+        def fn(t, w):
+            return torch.ops.aten._conv_depthwise2d(
+                t.permute(0, 3, 1, 2), w, (K_h, K_w), None, stride, padding, (1, 1)
+            )
+
+        def fn_ref(t, w):
+            return F.conv2d(
+                t.permute(0, 3, 1, 2), w, None, stride, padding, (1, 1), groups=C
+            )
+
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        # atol matches test_conv2d_cpu: fp16 conv accumulation is looser than the
+        # pool default.
+        compare_with_pytorch(fn, fn_ref, x_nhwc, weight, atol=0.5, rtol=0.1)
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):

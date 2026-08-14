@@ -880,3 +880,37 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     else:
         out_shape = out_shape[:dim] + out_shape[dim + 1 :]
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
+
+
+# ``aten::_conv_depthwise2d`` ships with a CUDA kernel only -- upstream registers
+# no CPU and no Meta kernel for it, and it is absent from both the global and the
+# Inductor decomposition tables.  Without a fake impl, tracing it under
+# torch.compile fails outright ("no fake impl or Meta kernel registered") before
+# Spyre's lowering ever gets a chance to run, so register one here.
+#
+# Shape rule matches aten/src/ATen/native/Convolution.cpp: weight is
+# (C_in * channel_multiplier, 1, K_h, K_w) and the output channel count is the
+# weight's dim 0, so a channel_multiplier > 1 widens C.  The Spyre lowering only
+# accepts channel_multiplier == 1, but the fake impl stays faithful to the ATen
+# contract -- narrowing belongs in the lowering's guards, not in shape inference.
+@torch.library.register_fake("aten::_conv_depthwise2d")
+def _(
+    self: torch.Tensor,
+    weight: torch.Tensor,
+    kernel_size: Sequence[int],
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+) -> torch.Tensor:
+    N, _, H_in, W_in = self.shape
+    C_out = weight.shape[0]
+    K_h, K_w = kernel_size
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    return self.new_empty((N, C_out, H_out, W_out))

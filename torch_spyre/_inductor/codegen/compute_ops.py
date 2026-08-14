@@ -267,7 +267,21 @@ def gen_coord_info_value(
     stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
+    padded_size: int | None = None,
 ):
+    """Build one dim's coordInfo entry.
+
+    ``size`` is the dim's logical extent on this core and sets the affine
+    ``alpha_`` (how far one step along the dim advances).  ``padded_size``, when
+    given, is the larger extent the data physically spans -- a windowed
+    reduction's input covers ``size + (K-1)*dilation`` elements -- and sets only
+    the ``elem_arr_0`` factor.  The two differ exactly when a window slides over
+    the dim: alpha_ must stay the unpadded advance while the element array has to
+    cover the whole padded span (cf. a reference conv descriptor's input i:
+    alpha_=18, elem_arr_0=20).  Defaults to ``size``, i.e. no padding.
+    """
+    if padded_size is None:
+        padded_size = size
     if not is_stick_dim:
         return {
             "spatial": 3,
@@ -285,7 +299,7 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": size, "label_": "elem_arr_0"},
+                    {"factor_": padded_size, "label_": "elem_arr_0"},
                 ],
             },
         }
@@ -1063,7 +1077,7 @@ def generate_sdsc(
                 corresponding generated coordinate information value structure.
         """
         layout = sdsc_spec.layouts[tensor.layout]
-        dim_order = _filter_window_dims(layout["dim_order"])
+        dim_order = _filter_window_dims(layout["dim_order"], tensor.layout)
         stick_dim_order = layout["stick_dim_order"]
         is_input = tensor_idx < sdsc_spec.num_inputs
         result = {}
@@ -1072,6 +1086,11 @@ def generate_sdsc(
             scale = tensor.scales[dim]
             is_tiled = scale == 1
             nsplits = sdsc_spec.work_slices[dim] if is_tiled else 1
+            # alpha_ uses the dim's own (unpadded) extent; the padded extent only
+            # widens the element array.  For everything but a windowed input the
+            # two are the same, since _coord_size falls back to the iteration
+            # space size.  See gen_coord_info_value.
+            unpadded = sdsc_spec.iteration_space[dim] // nsplits if is_tiled else 1
             size = (
                 _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
                 // nsplits
@@ -1080,7 +1099,8 @@ def generate_sdsc(
             )
             is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
             result[dim_str] = gen_coord_info_value(
-                size=size,
+                size=unpadded,
+                padded_size=size,
                 nsplits=nsplits,
                 elems_per_stick=tensor.data_format.elems_per_stick(),
                 is_stick_dim=(dim in stick_dim_order),
@@ -1093,15 +1113,26 @@ def generate_sdsc(
             )
         return result
 
-    def _filter_window_dims(dims: list) -> list:
+    def _filter_window_dims(dims: list, layout_label: str | None = None) -> list:
         """Drop the op's reduction-window dims (e.g. pool ki/kj) from a dim order.
 
         sdsc_spec.window_dims is empty for ops without a reduction window, so
         this is a no-op for them.
+
+        ``layout_label`` names the tensor's layout when known.  Tensors listed in
+        ``sdsc_spec.window_dim_tensor_labels`` are indexed BY the window dims
+        (depthwise conv's KERNEL) and keep them; everything else has them
+        stripped.
         """
+        if layout_label is not None and layout_label in (
+            sdsc_spec.window_dim_tensor_labels
+        ):
+            return list(dims)
         return [d for d in dims if str(d) not in sdsc_spec.window_dims]
 
-    def _tensor_sched_layout_dims(dim_order: list) -> list:
+    def _tensor_sched_layout_dims(
+        dim_order: list, layout_label: str | None = None
+    ) -> list:
         """Return a tensor's own dim_order for scheduleTree_, minus window dims.
 
         scheduleTree_ layoutDimOrder_ must use the per-tensor dim_order, NOT the
@@ -1109,7 +1140,7 @@ def generate_sdsc(
         symbol Counter, different ordering), so sdsc_spec.layouts[label]["dim_order"]
         is only correct for the tensor that created that label.
         """
-        return _filter_window_dims(dim_order)
+        return _filter_window_dims(dim_order, layout_label)
 
     def _coord_size(dim, default: int, is_input: bool) -> int:
         """Per-dim coordinate size, overridable for input tensors (pool pads H/W)."""
@@ -1122,6 +1153,27 @@ def generate_sdsc(
         if is_input:
             return sdsc_spec.input_coord_padding.get(str(dim), "nopad")
         return "nopad"
+
+    def _tensor_coord_padding(tensor, tensor_idx: int) -> dict:
+        """Input-tensor padding tags, restricted to dims this tensor actually has.
+
+        ``sdsc_spec.input_coord_padding`` is keyed by the op's padded spatial dims
+        (pool/conv ``i``/``j``).  With a single input that is unambiguous, but a
+        two-input op like depthwise conv also has a weight tensor that is not
+        indexed by those dims at all -- declaring padding on a dim absent from the
+        tensor's own layout is rejected by the backend.  Intersect with the
+        tensor's dim order so each input only advertises padding it really has.
+        """
+        if not sdsc_spec.input_coord_padding:
+            return {}
+        tensor_dims = {
+            str(dim) for dim in _tensor_sched_layout_dims(tensor.dim_order, tensor.layout)
+        }
+        return {
+            dim: tag
+            for dim, tag in sdsc_spec.input_coord_padding.items()
+            if dim in tensor_dims
+        }
 
     def _memorg_extra(is_input: bool, alloc_node: str) -> dict:
         """Extra memOrg_ padding fields, emitted only when the op needs them."""
@@ -1249,7 +1301,7 @@ def generate_sdsc(
                                     "layoutDimOrder_": [
                                         str(dim)
                                         for dim in _filter_window_dims(
-                                            layout_info["dim_order"]
+                                            layout_info["dim_order"], label
                                         )
                                     ],
                                     "stickDimOrder_": [
@@ -1291,13 +1343,13 @@ def generate_sdsc(
                                     "layoutDimOrder_": [
                                         str(dim)
                                         for dim in _tensor_sched_layout_dims(
-                                            tensor.dim_order
+                                            tensor.dim_order, tensor.layout
                                         )
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
                                         for dim in _tensor_sched_layout_dims(
-                                            tensor.dim_order
+                                            tensor.dim_order, tensor.layout
                                         )
                                     ],
                                     **_build_indirect_access_fields(
@@ -1320,10 +1372,10 @@ def generate_sdsc(
                                         "data_": _start_addr_data(tensor),
                                     },
                                     **(
-                                        {"padding_": sdsc_spec.input_coord_padding}
+                                        {"padding_": _tensor_coord_padding(tensor, i)}
                                         if (
                                             i < sdsc_spec.num_inputs
-                                            and sdsc_spec.input_coord_padding
+                                            and _tensor_coord_padding(tensor, i)
                                         )
                                         else {}
                                     ),
@@ -1347,7 +1399,7 @@ def generate_sdsc(
                                                 in {
                                                     str(d)
                                                     for d in _tensor_sched_layout_dims(
-                                                        tensor.dim_order
+                                                        tensor.dim_order, tensor.layout
                                                     )
                                                 }
                                             }
@@ -1372,7 +1424,8 @@ def generate_sdsc(
                                         for dim in _filter_window_dims(
                                             sdsc_spec.layouts[tensor.layout][
                                                 "dim_order"
-                                            ]
+                                            ],
+                                            tensor.layout,
                                         )
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
@@ -1425,7 +1478,17 @@ def generate_sdsc(
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
                                         if i not in sdsc_spec.indirect_access_indices
-                                    ],
+                                    ]
+                                    # An accumulating op reads its own output as a
+                                    # third operand (dst = FMA(src, kernel, dst)),
+                                    # so the output is bound as both an input and
+                                    # an output -- cf. depthwise_conv_fwd.ddl's
+                                    # operation_bind([in, kernel, out], [out]).
+                                    + (
+                                        [f"Tensor{out_idx}-idx{out_idx}"]
+                                        if sdsc_spec.accumulates_into_output
+                                        else []
+                                    ),
                                     "outputLabeledDs": [
                                         f"Tensor{out_idx}-idx{out_idx}"
                                     ],

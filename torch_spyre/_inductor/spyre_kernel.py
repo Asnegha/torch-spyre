@@ -36,10 +36,11 @@ from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
     IDENTITY_OP,
-    POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
+    TWO_INPUT_REDUCTION_OPS,
+    WINDOW_REDUCTION_OPS,
 )
 from . import config as _spyre_config
 from .errors import Unsupported
@@ -925,15 +926,16 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
 
-        # Carry the pool node's full logical output ranges (NCHW, incl. unit
-        # dims) so codegen can derive surviving dim roles and the channel count
-        # from live IR instead of a lowering-time size snapshot.  Store raw
-        # ranges (no int(): ranges may be symbolic); consumers convert only
-        # static dims.  Populated only for pools — the only consumer — so
-        # non-pool kernels' generated source is unchanged.
+        # Carry the windowed-reduction node's full logical output ranges (NCHW,
+        # incl. unit dims) so codegen can derive surviving dim roles and the
+        # channel count from live IR instead of a lowering-time size snapshot.
+        # Store raw ranges (no int(): ranges may be symbolic); consumers convert
+        # only static dims.  Populated only for windowed reductions (pools and
+        # depthwise conv) — the only consumers — so other kernels' generated
+        # source is unchanged.
         node_output_ranges = (
             tuple(ir_node.data.ranges)
-            if op in POOL_OPS
+            if op in WINDOW_REDUCTION_OPS
             and hasattr(ir_node, "data")
             and hasattr(ir_node.data, "ranges")
             else None
@@ -1154,7 +1156,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+        if value.op in TWO_INPUT_REDUCTION_OPS:
+            # Two-input reductions (matmul family, depthwise conv) come from a
+            # lowering whose inner_fn returns a tuple of two loads, so they emit
+            # an [input, kernel, output] TensorArg triple.
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))

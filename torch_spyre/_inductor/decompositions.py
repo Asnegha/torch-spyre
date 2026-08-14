@@ -721,6 +721,36 @@ def conv2d_via_bmm_decomp(
             f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
         )
 
+    # A depthwise convolution (one group per input channel, one output channel
+    # per group) has a native hardware opfunc, ``depthwiseconv2dnative``.  Route
+    # it to ``aten._conv_depthwise2d``, which ``lower_conv_depthwise2d`` claims,
+    # instead of expanding it into unfold+BMM: unfold materializes a
+    # K_h*K_w-times larger patch tensor and currently falls back to CPU.
+    #
+    # Only redirect what that lowering actually accepts, so anything it would
+    # reject keeps working via the BMM path below rather than becoming a hard
+    # error.  Keep these conditions in sync with the guards in
+    # ``lower_conv_depthwise2d``.
+    if (
+        groups == C_in
+        and C_in_per_group == 1
+        and C_out == C_in
+        and bias is None
+        and (dil_h, dil_w) == (1, 1)
+        and (pad_h, pad_w) == (0, 0)
+        and K_h > 1
+        and K_w > 1
+    ):
+        return torch.ops.aten._conv_depthwise2d(
+            input,
+            weight,
+            (K_h, K_w),
+            bias,
+            (stride_h, stride_w),
+            (pad_h, pad_w),
+            (dil_h, dil_w),
+        )
+
     H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
     W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
 

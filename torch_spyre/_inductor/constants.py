@@ -183,11 +183,35 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+# Conv2d emits its TensorArgs in [input, kernel, output] order (see
+# kernel_store_reduction), so the layout labels are assigned in that order --
+# unlike LAYOUT_LABELS, whose first slot is OUTPUT.
+CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
 # _is_pool stays a single membership test rather than a growing chain of ==.
 POOL_OPS = {AVGPOOL2D_OP}
+
+DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
+
+# Reductions over a 2D spatial window: they share the pool iteration-space shape
+# (batch, out-H, out-W, channel, win-H, win-W -- see POOL_DIM_LABELS) and so
+# share the window/padding SDSC descriptor machinery in codegen.
+#
+# Deliberately a superset of POOL_OPS rather than an extension of it: POOL_OPS
+# membership additionally implies "exactly one input tensor and an averaging
+# `nmap` constant", neither of which holds for depthwise conv (it takes an
+# activation *and* a weight, and does not normalize by the window size). Codegen
+# tests POOL_OPS for those two single-input/averaging behaviours and
+# WINDOW_REDUCTION_OPS for the shape-driven ones.
+WINDOW_REDUCTION_OPS = POOL_OPS | {DEPTHWISE_CONV2D_OP}
+
+# Reductions that consume two input tensors, so codegen emits an
+# [input, kernel, output] TensorArg triple instead of the default
+# [input, output] pair (see kernel_store_reduction in spyre_kernel.py).
+TWO_INPUT_REDUCTION_OPS = MATMUL_REDUCTION_OPS | {DEPTHWISE_CONV2D_OP}
+
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
@@ -199,3 +223,10 @@ MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
 # (OpSpec.node_output_ranges), never from these strings, so SDSC naming does not
 # leak above codegen.
 POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
+
+# Canonical depthwise-conv2d iteration-space order: batch, channel, out-H,
+# out-W, kernel-H, kernel-W. Unlike POOL_DIM_LABELS this is NCHW (channel ahead
+# of the spatial dims), matching the order the conv2d lowering emits its
+# ``ranges`` in. Sliced from the tail like MATMUL_DIM_LABELS, so leading dims
+# drop off first as unit dims are squeezed out of the iteration space.
+CONV2D_DIM_LABELS = ["mb", "out", "i", "j", "ki", "kj"]
