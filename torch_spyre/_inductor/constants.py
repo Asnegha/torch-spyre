@@ -181,6 +181,13 @@ SPYRE_FP8_OPS = {
 
 TOPK_OPS = {"topkvalue", "topkindex"}
 
+# Largest k the Spyre topkvalue/topkindex opfunc can produce in a single pass.
+# Past this the DeepTools backend compiler aborts in ddcv1.cpp ("Cannot
+# allocate even the smallest size") -- confirmed by patching only the output
+# extent of a known-good k=4 SDSC and re-running dxp_standalone. Larger k is
+# lowered as several k <= TOPK_MAX_HW_K passes (see _lower_topk_chunked).
+TOPK_MAX_HW_K = 4
+
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 # Conv2d emits its TensorArgs in [input, kernel, output] order (see

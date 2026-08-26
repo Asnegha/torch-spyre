@@ -45,8 +45,8 @@ minimum split. The three passes are implemented in
 and dispatched from `CustomPreSchedulingPasses` in
 [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
 
-The planner only sees ops whose IR data is `Pointwise` or `Reduction`
-(and excluding TopK reductions, which return early). `FallbackKernel`,
+The planner only sees ops whose IR data is `Pointwise` or `Reduction`.
+`FallbackKernel`,
 `ExternKernel`, `SpyreConstantFallback`, and `SpyreEmptyFallback`
 allocation kernels are filtered out earlier and never reach the passes.
 
@@ -581,8 +581,13 @@ annotations and use the automatic work-distribution planner.
   the requested component yet.
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work
   division. `ExternKernel` and `FallbackKernel` nodes are skipped.
-- TOPK reductions currently run single-core, so `work_div` hints on TOPK
-  operations are ignored with a warning.
+- TOPK reductions are divided across cores on their batch-like dimensions
+  only. Their reduction dimension is always held at a single core, because a
+  core sorting one slice of the reduction range yields the top-k of that
+  slice and no cross-core merge step exists to combine those partial
+  results. A `work_div` hint that asks to split a TOPK reduction dimension
+  is ignored for that dimension with a warning; the remaining dimensions in
+  the hint still apply.
 - Each pass plans one op at a time. Adjacent ops can pick incompatible
   per-core splits for a shared tensor, which the LX scratchpad planner
   then treats as a core-division mismatch.

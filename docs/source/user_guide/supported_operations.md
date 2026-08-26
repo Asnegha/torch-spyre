@@ -72,7 +72,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.prod` | | Y | Spyre | Requires `dim` argument; custom decomposition + lowering |
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
 | `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16 eager); int64 falls back to CPU |
-| `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
+| `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`); 2-D input, `k <= 4` (hardware opfunc limit) |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |

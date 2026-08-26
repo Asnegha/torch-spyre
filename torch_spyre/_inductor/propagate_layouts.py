@@ -1351,6 +1351,30 @@ def _target_device_layout(target, name: str):
     return next(iter(layouts))
 
 
+def _mutation_target_stl(target, name: str, target_buf):
+    """Device layout for a mutation write's target, including intermediates.
+
+    Extends :func:`_target_device_layout` (graph inputs and already-tiled
+    targets) with the in-graph intermediate case: the ``aten.empty`` destination
+    ``lower_cat`` writes each of its inputs into is neither a graph input nor yet
+    a ``FixedTiledLayout``, but layout propagation already visited it (operations
+    come in topological order), so its candidate layouts sit on the buffer.
+
+    Without this the target resolves to ``None`` and the write's layout
+    assignment is skipped entirely, leaving the mutation op with no layout --
+    which silently miscompiles concatenated results rather than failing.
+    """
+    stl = _target_device_layout(target, name)
+    if stl is not None:
+        return stl
+
+    buf_layouts = getattr(target_buf, "layouts", None)
+    if buf_layouts:
+        return next(iter(buf_layouts))
+
+    return None
+
+
 def _find_alt_target_stl(
     target_layout: FixedLayout,
     target_stl: SpyreTensorLayout,
@@ -1629,7 +1653,7 @@ def propagate_spyre_tensor_layouts(
                 # Look up the actual buffer node (unwraps TensorBox/StorageBox
                 # wrappers that coarse_tile.py places around SpyreEmptyFallback).
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
-                target_stl = _target_device_layout(target, target_name)
+                target_stl = _mutation_target_stl(target, target_name, target_buf)
                 if target_stl is None:
                     if not isinstance(target_buf, SpyreEmptyFallback):
                         # op gets no .layouts/.restick_cost_fn at all; any

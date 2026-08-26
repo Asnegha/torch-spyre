@@ -1186,6 +1186,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
                 # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
+                # Batch dims large enough for work division to split topk over
+                # several cores (the reduction dim always stays on one core).
+                "2d_k4_dim_minusone_multicore": (
+                    unique_randn_along_dim((512, 256), dim=-1),
+                    4,
+                    -1,
+                ),
+                "2d_k4_dim0_multicore": (
+                    unique_randn_along_dim((256, 512), dim=0),
+                    4,
+                    0,
+                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {

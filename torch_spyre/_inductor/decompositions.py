@@ -332,8 +332,8 @@ def spyre_topk(
     k: int,
     dim: Optional[int] = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 4:
-        raise Unsupported("Topk is not supported for this config")
+    # k > 4 exceeds what the topk opfunc does in one pass; the lowering splits
+    # it into several k <= TOPK_MAX_HW_K passes (see _lower_topk_chunked).
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )

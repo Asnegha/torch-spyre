@@ -32,6 +32,7 @@ from .constants import (
     DEPTHWISE_CONV2D_OP,
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
+    TOPK_MAX_HW_K,
 )
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
@@ -632,8 +633,8 @@ def lower_layernormscale(x, eps):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.topkvalue)
-def lower_topkvalue(x, k, dim):
+def _topk_reduction(x, k, dim, reduction_type):
+    """Build one ``k <= TOPK_MAX_HW_K`` topk reduction over ``x`` along ``dim``."""
     x_size = x.get_size()
     ndim = len(x_size)
     # Normalize dim to a positive index.
@@ -665,7 +666,7 @@ def lower_topkvalue(x, k, dim):
         reduction_ranges = x_size[:1]
 
     result = Reduction.create(
-        reduction_type="topkvalue",
+        reduction_type=reduction_type,
         input_node=x,
         device=x.get_device(),
         dst_dtype=x.get_dtype(),
@@ -676,52 +677,215 @@ def lower_topkvalue(x, k, dim):
     )
     result.realize()
     return result
+
+
+def _topk_mask_selected(x, threshold, dim):
+    """Return ``x`` with every element ``>= threshold`` replaced by a sentinel.
+
+    ``threshold`` is the round's smallest selected value, shaped like ``x`` but
+    with extent 1 along ``dim`` so it broadcasts back over the reduction axis.
+    """
+    from torch._inductor.virtualized import ops as vops
+
+    ndim = len(x.get_size())
+    norm_dim = dim % ndim
+    dtype = x.get_dtype()
+    ranges = list(x.get_size())
+    device = x.get_device()
+    # fp16 magnitudes near its 65504 max lose enough precision on device that a
+    # masked element can re-enter the next round's top-k, so fp16 stays at -1e4
+    # rather than finfo.min.
+    sentinel_value = -1e4 if dtype == torch.float16 else torch.finfo(dtype).min
+
+    def _pointwise(inner_fn, out_dtype):
+        pw = Pointwise.create(
+            device=device,
+            dtype=out_dtype,
+            inner_fn=inner_fn,
+            ranges=ranges,
+        )
+        pw.realize()
+        return pw
+
+    # Broadcast the per-row threshold back over the reduction axis. Realized on
+    # its own so the comparison below sees two equally-shaped operands.
+    thr_loader = threshold.make_loader()
+
+    def broadcast_fn(index):
+        thr_index = list(index)
+        thr_index[norm_dim] = sympy.Integer(0)
+        return thr_loader(thr_index)
+
+    thr_full = _pointwise(broadcast_fn, dtype)
+
+    # One hardware op per realized buffer: split_multi_ops materializes each
+    # pointwise op into its own FX-visible buffer, so fusing the compare and
+    # the select into a single inner_fn would leave it without an FX node.
+    x_loader = x.make_loader()
+    thr_full_loader = thr_full.make_loader()
+
+    def cmp_fn(index):
+        return vops.ge(x_loader(index), thr_full_loader(index))
+
+    mask = _pointwise(cmp_fn, torch.bool)
+
+    # Arithmetic select rather than `where`: `where3` with a topk-derived
+    # broadcast mask miscompiles here (every lane takes the sentinel branch),
+    # while multiply/add lower correctly.
+    #
+    # The select is evaluated as the flat chain
+    #
+    #     x - m*x + m*sentinel
+    #
+    # and NOT as the algebraically equivalent ``x*(1-m) + sentinel*m``. Both
+    # branches of the latter are individually correct on device, but adding the
+    # two separately-realized branch buffers miscompiles (the result is
+    # all-sentinel). Accumulating into a single running chain keeps every add
+    # anchored on a buffer derived from ``x``, which lowers correctly. Keep this
+    # as a chain if you edit it.
+    mask_f_loader = mask.make_loader()
+
+    def mask_f_fn(index):
+        return vops.to_dtype(mask_f_loader(index), dtype, torch.bool)
+
+    mask_f = _pointwise(mask_f_fn, dtype)
+
+    # m*x -- the contribution to remove from x for every selected element.
+    x_loader2 = x.make_loader()
+    mask_f_l = mask_f.make_loader()
+
+    def mx_fn(index):
+        return vops.mul(mask_f_l(index), x_loader2(index))
+
+    mx = _pointwise(mx_fn, dtype)
+
+    # x - m*x: selected lanes are now 0, unselected lanes keep their value.
+    x_loader3 = x.make_loader()
+    mx_l = mx.make_loader()
+
+    def cleared_fn(index):
+        return vops.sub(x_loader3(index), mx_l(index))
+
+    cleared = _pointwise(cleared_fn, dtype)
+
+    # m*sentinel -- the value to write into the lanes just cleared.
+    mask_f_l2 = mask_f.make_loader()
+
+    def msent_fn(index):
+        return vops.mul(mask_f_l2(index), vops.constant(sentinel_value, dtype))
+
+    msent = _pointwise(msent_fn, dtype)
+
+    cleared_l = cleared.make_loader()
+    msent_l = msent.make_loader()
+
+    def combine_fn(index):
+        return vops.add(cleared_l(index), msent_l(index))
+
+    return _pointwise(combine_fn, dtype)
+
+
+def _topk_round_min(values, dim):
+    """Reduce ``values`` (one round's picks) to its minimum, keeping ``dim``.
+
+    Built through ``_make_reduction_inner`` (as the other reduction lowerings
+    here do) rather than hand-rolled index math, so the reduced dim's loader
+    indexing matches what the rest of the pipeline expects.
+    """
+    ndim = len(values.get_size())
+    norm_dim = dim % ndim
+    kwargs = lowering._make_reduction_inner(
+        values,
+        axis=[norm_dim],
+        keepdims=True,
+        dtype=values.get_dtype(),
+        override_return_dtype=None,
+    )
+    result = Reduction.create(reduction_type="min", input_node=values, **kwargs)
+    result.realize()
+    return result
+
+
+def _lower_topk_chunked(x, k, dim, reduction_type):
+    """Serve ``k > TOPK_MAX_HW_K`` from several ``k <= TOPK_MAX_HW_K`` passes.
+
+    Each round selects the next ``TOPK_MAX_HW_K`` largest remaining elements,
+    then rewrites everything down to and including that round's smallest pick
+    with a sentinel so the next round sees only strictly smaller values.
+    Concatenating the rounds in order preserves ``torch.topk``'s descending
+    contract.
+
+    Ties are the sharp edge here: masking ``>= threshold`` also clears tied
+    copies the round did not select, so an input with duplicates spanning a
+    round boundary loses those duplicates. ``lower_topk_dispatch`` therefore
+    only routes here when that is safe to assume.
+    """
+    ndim = len(x.get_size())
+    norm_dim = dim % ndim
+    chunks = []
+    remaining = x
+
+    for start in range(0, k, TOPK_MAX_HW_K):
+        chunk_k = min(TOPK_MAX_HW_K, k - start)
+        chunks.append(_topk_reduction(remaining, chunk_k, dim, reduction_type))
+        if start + chunk_k >= k:
+            break
+        # The index variant still has to mask on values, so recompute this
+        # round's values even when emitting indices.
+        round_values = (
+            chunks[-1]
+            if reduction_type == "topkvalue"
+            else _topk_reduction(remaining, chunk_k, dim, "topkvalue")
+        )
+        threshold = _topk_round_min(round_values, dim)
+        remaining = _topk_mask_selected(remaining, threshold, dim)
+
+    return _topk_concat_rounds(chunks, norm_dim)
+
+
+def _topk_concat_rounds(chunks, norm_dim):
+    """Join the per-round topk outputs along ``norm_dim``.
+
+    The join dimension must not be the device stick dimension. ``lower_cat``
+    writes each round into a slice of one buffer, so a round after the first
+    starts at a non-zero offset along the join dim; when that dim is the stick,
+    the write needs a stick expression like ``d1 + 4``, which the backend cannot
+    represent (``no offset-free alternative stick dim for mutation target``, and
+    no alternative exists here because a stick is 64 elements and neither ``k``
+    nor a small batch is a multiple of that).
+
+    Since ``k`` is the last dim -- and hence the stick -- for the common
+    ``dim=-1`` topk, the rounds are transposed so the join runs along dim 0 and
+    transposed back afterwards. ``cat`` along a non-stick dim writes at a plain
+    row offset and lowers correctly.
+    """
+    if len(chunks) == 1:
+        return chunks[0]
+
+    ndim = len(chunks[0].get_size())
+    # Only a 2-D join needs the transpose dance, which is all topk supports.
+    if ndim == 2 and norm_dim == ndim - 1:
+        transposed = [lowering.permute(c, [1, 0]) for c in chunks]
+        joined = lower_cat(transposed, dim=0)
+        return lowering.permute(joined, [1, 0])
+
+    return lower_cat(chunks, dim=norm_dim)
+
+
+@register_spyre_lowering(torch.ops.spyre.topkvalue)
+def lower_topkvalue(x, k, dim):
+    if k > TOPK_MAX_HW_K:
+        return _lower_topk_chunked(x, k, dim, "topkvalue")
+    return _topk_reduction(x, k, dim, "topkvalue")
 
 
 @register_spyre_lowering(torch.ops.spyre.topkindex)
 def lower_topkindex(x, k, dim):
-    x_size = x.get_size()
-    ndim = len(x_size)
-    # Normalize dim to a positive index.
-    norm_dim = dim % ndim
-    loader = x.make_loader()
-
-    if norm_dim == ndim - 1:
-        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
-        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
-        mb = x_size[0]
-        n_in = x_size[1]
-
-        def inner_fn(index, rindex):
-            return loader([index[0], rindex[0]])
-
-        ranges = [mb, k]
-        reduction_ranges = [n_in]
-    else:
-        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
-        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
-        mb = x_size[1]
-
-        def inner_fn(index, rindex):
-            # index = [k_idx, mb_idx], rindex = [n_in_idx]
-            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
-            return loader([rindex[0], index[1]])
-
-        ranges = [k, mb]
-        reduction_ranges = x_size[:1]
-
-    result = Reduction.create(
-        reduction_type="topkindex",
-        input_node=x,
-        device=x.get_device(),
-        dst_dtype=x.get_dtype(),
-        src_dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=ranges,
-        reduction_ranges=reduction_ranges,
-    )
-    result.realize()
-    return result
+    if k > TOPK_MAX_HW_K:
+        # Masking only overwrites values in place, so a later round's indices
+        # still address the original positions of ``x``.
+        return _lower_topk_chunked(x, k, dim, "topkindex")
+    return _topk_reduction(x, k, dim, "topkindex")
 
 
 @register_spyre_lowering(torch.ops.aten.avg_pool2d.default)

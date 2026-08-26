@@ -763,18 +763,14 @@ def enumerate_work_division_candidates(
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
-    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
-    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space.
+    ``TOPK`` reductions may split their non-reduction dims across cores, but
+    never the reduction dim itself (see ``valid_split`` below).
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
-
-    # TOPK reductions run single-core (see divide_reduction_op): the only
-    # permissible "division" is the unsplit one.
-    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
-        return [{v: 1 for v in it_space}]
 
     input_tds, output_td = collect_tensor_deps(
         op, get_mem_deps_from_rw(op_read_writes(op))
@@ -791,6 +787,10 @@ def enumerate_work_division_candidates(
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     mask_blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+
+    # Splitting the batch-like dims is safe: each core then owns whole
+    # reduction rows. Splitting the reduction dim is not (see _is_topk_op).
+    is_topk = _is_topk_op(op)
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
@@ -810,6 +810,8 @@ def enumerate_work_division_candidates(
         if math.prod(splits.values()) > max_cores:  # core budget
             return False
         if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
+            return False
+        if is_topk and any(splits[v] > 1 for v in reduction_vars):
             return False
         if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
             get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
@@ -929,6 +931,17 @@ def _apply_user_hint(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
+    # A hint must not be able to request something that computes the wrong
+    # answer: drop reduction-dim splits for TOPK (see _is_topk_op).
+    if reduction_vars_to_split and _is_topk_op(op):
+        logger.warning(
+            f"work_division_hint: {op_name} ignores the requested split of "
+            f"reduction dim(s) {reduction_vars_to_split} because a per-core "
+            f"top-k of a slice cannot be merged; splitting other dims only."
+        )
+        for sym in reduction_vars_to_split:
+            splits[sym] = 1
+
     return splits
 
 
@@ -942,6 +955,17 @@ def _commit_user_splits(
             delattr(op, "op_it_space_splits")
         return
     apply_splits(op, splits, output_td)
+
+
+def _is_topk_op(op: ComputedBuffer) -> bool:
+    """True when ``op`` is a TOPK reduction.
+
+    TOPK may be split across cores on its batch-like dims, but never on its
+    reduction dim: a core sorting one slice of the reduction range produces the
+    top-k of that slice, and no cross-core merge step exists to combine those
+    partial results into the true top-k.
+    """
+    return isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS
 
 
 def span_reduction_pass(
@@ -989,6 +1013,15 @@ def span_reduction_pass(
             f"({MAX_SPAN_BYTES / (1024**2):.3f}MB) without splitting "
             f"{len(reduction_vars_to_split)} reduction dimension(s) "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
+        )
+
+    # TOPK cannot merge per-core partial top-k results, so a reduction split is
+    # wrong rather than merely slow. Refuse instead of silently miscomputing.
+    if reduction_vars_to_split and _is_topk_op(op):
+        raise Unsupported(
+            f"topk needs its reduction dim {reduction_vars_to_split} split "
+            f"across cores to fit the {MAX_SPAN_BYTES / (1024**2):.3f}MB span "
+            f"limit, but a per-core top-k of a slice cannot be merged."
         )
 
     apply_splits(op, min_splits, output_td)
@@ -1144,6 +1177,10 @@ def work_distribution_pass(
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+    if _is_topk_op(op):
+        # Block every reduction dim so the greedy distributor spends its cores
+        # on the batch-like dims only (see _is_topk_op).
+        blocked = blocked | set(reduction_vars)
     splits, output_dims, reduction_dims = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
     )
@@ -1520,18 +1557,9 @@ def divide_reduction_op(
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    red: Reduction = op.data
-
-    # Currently we support Topk for k<=4, which can be handled efficiently on single core
-    # TODO: Modification will be required to enable Topk for k>4
-    if red.reduction_type in TOPK_OPS:
-        if not config.ignore_work_division_hints and _has_work_div_hint(op):
-            logger.warning(
-                f"work_division_hint: {op.get_name()} ignores work_div hint "
-                f"because TOPK reductions run single-core."
-            )
-        return
-
+    # TOPK reductions divide like any other reduction. The reduction dim itself
+    # is held at a single core by enumerate_work_division_candidates (a per-core
+    # top-k of a slice cannot be merged), so only the batch-like dims are split.
     pass_fn(op, args, max_cores)
 
 
