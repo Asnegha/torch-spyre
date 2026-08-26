@@ -60,7 +60,9 @@ from .propagate_hints import get_op_hints
 from .work_division_constraints import (
     WorkDivConstraintContext,
     collect_work_division_constraints,
+    find_topk_k_symbol,
     has_qfp8wt_tensor,
+    topk_valid_k_splits,
 )
 from typing import Callable
 
@@ -696,18 +698,15 @@ def enumerate_work_division_candidates(
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
-    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
-    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    For ``TOPK`` reductions, k's candidate factors are restricted to the
+    divisors ``d`` with ``k / d <= TOPK_MAX_K_PER_CORE``, and the search-space
+    dim is pinned to 1 by the ``topk_search_space_pinned`` constraint.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
-
-    # TOPK reductions run single-core (see divide_reduction_op): the only
-    # permissible "division" is the unsplit one.
-    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
-        return [{v: 1 for v in it_space}]
+    is_topk = isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS
 
     input_tds, output_td = collect_tensor_deps(
         op, get_mem_deps_from_rw(op_read_writes(op))
@@ -723,6 +722,11 @@ def enumerate_work_division_candidates(
     # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    # topk's k dim may only be split so that each core's share of the k rows
+    # stays within the hardware's per-core limit.
+    topk_k_sym = find_topk_k_symbol(output_td, input_tds) if is_topk else None
+
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -741,6 +745,9 @@ def enumerate_work_division_candidates(
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
     def factors(v: Symbol) -> list[int]:
+        if topk_k_sym is not None and v == topk_k_sym:
+            k_val = concretize_expr(it_space[v])
+            return topk_valid_k_splits(k_val, max_cores) or [1]
         if v in symbol_meta:
             basis = symbol_meta[v][1]  # granularity
         elif v in stick_vars:
@@ -1506,18 +1513,6 @@ def divide_reduction_op(
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    red: Reduction = op.data
-
-    # Currently we support Topk for k<=4, which can be handled efficiently on single core
-    # TODO: Modification will be required to enable Topk for k>4
-    if red.reduction_type in TOPK_OPS:
-        if not config.ignore_work_division_hints and _has_work_div_hint(op):
-            logger.warning(
-                f"work_division_hint: {op.get_name()} ignores work_div hint "
-                f"because TOPK reductions run single-core."
-            )
-        return
-
     pass_fn(op, args, max_cores)
 
 

@@ -34,6 +34,7 @@ import torch._decomp as decomp
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
+from .work_division_constraints import TOPK_MAX_K_PER_CORE
 from . import config
 from .logging_utils import get_inductor_logger
 
@@ -335,8 +336,17 @@ def spyre_topk(
     largest: bool = True,
     sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 4:
-        raise Unsupported("Topk is not supported for this config")
+    # A core emits at most TOPK_MAX_K_PER_CORE ranked results, so larger k is
+    # served by splitting k across cores (see work_division_constraints.
+    # topk_k_split_pinned). k must still be divisible into per-core shares
+    # within that limit, which work division verifies exactly; here we only
+    # reject k that no core count could satisfy.
+    max_k = TOPK_MAX_K_PER_CORE * config.sencores
+    if k > max_k:
+        raise Unsupported(
+            f"topk with k={k} is not supported (max k={max_k} = "
+            f"{TOPK_MAX_K_PER_CORE} per core x {config.sencores} cores)"
+        )
     if not largest:
         raise Unsupported("topk with largest=False")
     # sorted=False only relaxes the ordering guarantee (any order of the top-k
