@@ -1319,13 +1319,18 @@ def _topk_layouts(
 
     # Collect candidate output stick dims. A valid input stick passes through;
     # a stick on the reduction var requires a restickify, so every surviving
-    # coord becomes a candidate.
+    # coord becomes a candidate. If no surviving coord exists (e.g. every
+    # other dim has host size 1, as with shape (1, N) and dim=1), fall back
+    # to no stick (None) -- same synthetic-stick fallback exx2 always uses.
     out_stick_dims: set[int | None] = set()
     for stl in x.layouts:
         x_stick_expr = device_coordinates(stl, x.dep, None)[-1]
         if reduction_var in x_stick_expr.free_symbols:
-            for c in surviving_coords:
-                out_stick_dims.add(matching_dim(out_coords, c))
+            if surviving_coords:
+                for c in surviving_coords:
+                    out_stick_dims.add(matching_dim(out_coords, c))
+            else:
+                out_stick_dims.add(None)
         else:
             out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
 
@@ -1343,7 +1348,39 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    force_restickify_targets = None
+    if None in out_stick_dims:
+        # A synthetic (no real dim) stick output candidate exists because no
+        # surviving host dim is available -- e.g. shape (1, N) with dim=1,
+        # where the only other dim has host size 1.
+        #
+        # x's committed input layout keeps its stick on the reduction dim
+        # (its only natural choice for this shape); that stick is forbidden
+        # for topk (_check_stick_topk). Since the output's synthetic stick
+        # has no free symbol, compute_restickify_needed's stick_compatible()
+        # check sees the input's stick symbol as trivially disjoint from the
+        # (symbol-free) output stick and wrongly reports "already
+        # compatible, no restickify needed" -- it only checks pairwise
+        # symbol disjointness, not topk's stricter "this individual symbol
+        # is forbidden outright" rule. Force a restickify onto a matching
+        # synthetic-stick input layout for every candidate x currently has,
+        # bypassing that shortcut.
+        x_host_size = [concretize_expr(s) for s in x.layout.size]
+        x_host_stride = [concretize_expr(s) for s in x.layout.stride]
+        x_synthetic_stl = SpyreTensorLayout(
+            x_host_size,
+            x_host_stride,
+            x.layout.dtype,
+            list(range(len(x_host_size))) + [-1],
+        )
+        force_restickify_targets = [
+            {stl: x_synthetic_stl for stl in x.layouts} if arg is x else None
+            for arg in args
+        ]
+
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, results, output_dep, op, force_restickify_targets
+    )
     return results
 
 

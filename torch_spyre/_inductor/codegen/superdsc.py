@@ -1219,19 +1219,37 @@ def _create_sdsc_tensors(
                 dim_order = dim_order + reduced_dims
 
         # Step 3: Handle missing stick dimension — skip for index tensors.
+        topk_stick_fallback_sym = injected_dims.get("topk_stick_fallback_sym")
         if op_stick_dim is None:
             if not (has_indirect_access and i in index_tensor_indices):
-                stick_dim = next(d for d in dims if d not in op_dim_order)
-                # The chosen dim is absent from the *op*'s dim_order, but an
-                # individual arg may already carry it: a conv2d kernel tensor
-                # gets ki/kj added explicitly by _get_device_dim_order (they are
-                # structural for the weight even when they do not appear in its
-                # device_coordinates). Appending unconditionally would repeat the
-                # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
-                # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
-                # rejects with "external allocations with repeated dimensions".
-                if stick_dim not in dim_order:
+                if topk_stick_fallback_sym is not None:
+                    # Use the single op-level fallback stick chosen above
+                    # (superdsc.py's op_stick_dim-is-None branch) for every
+                    # arg, rather than independently re-deriving a candidate
+                    # per arg from dict order. topk's synthetic-stick input
+                    # and output tensors can otherwise resolve to two
+                    # different existing symbols (see TOPK_1XN_DEBUG_NOTES.md),
+                    # leaving the real fallback stick dim out of every
+                    # tensor's dim_order -- "None of the dimensions is
+                    # mapped" at the backend. Append unconditionally (not
+                    # guarded by "not in dim_order" like the generic path
+                    # below): this symbol is never already present for topk,
+                    # since it was freshly injected specifically because no
+                    # tensor's own coordinates carry it.
+                    stick_dim = topk_stick_fallback_sym
                     dim_order = dim_order + [stick_dim]
+                else:
+                    stick_dim = next(d for d in dims if d not in op_dim_order)
+                    # The chosen dim is absent from the *op*'s dim_order, but an
+                    # individual arg may already carry it: a conv2d kernel tensor
+                    # gets ki/kj added explicitly by _get_device_dim_order (they are
+                    # structural for the weight even when they do not appear in its
+                    # device_coordinates). Appending unconditionally would repeat the
+                    # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
+                    # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
+                    # rejects with "external allocations with repeated dimensions".
+                    if stick_dim not in dim_order:
+                        dim_order = dim_order + [stick_dim]
 
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
@@ -1913,6 +1931,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     _stick_label,
                 )
 
+    op_stick_fallback_sym: Symbol | None = None
     if op_stick_dim is None:
         if is_pool or _is_depthwise_conv(op_spec.op):
             # Pool/depthwise-conv op where C fits in one stick (e.g. C=1): the
@@ -1956,6 +1975,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             ].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
+        op_stick_fallback_sym = stick_sym
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
@@ -1992,6 +2012,21 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if index_stick_syms:
         injected_dims["index_stick_syms"] = index_stick_syms
+    if _is_topk(op_spec.op) and op_stick_fallback_sym is not None:
+        # The op-level fallback stick (op_stick_fallback_sym, injected above
+        # because ref_arg -- the input, for a reduction -- has no natural
+        # stick coordinate) must be the SAME symbol Step 3 of
+        # _create_sdsc_tensors picks for every arg. Step 3's default
+        # ``next(d for d in dims if d not in op_dim_order)`` instead derives
+        # a per-arg candidate from dict order, which for topk's shape-(1, N)
+        # synthetic-stick tensors can resolve to a different, already
+        # in-use symbol for the input than for the output (see
+        # TOPK_1XN_DEBUG_NOTES.md) -- leaving the op-level stick dim
+        # orphaned (present in sdsc_iteration_space/N_ but absent from every
+        # tensor's layoutDimOrder_), which the backend rejects with "None of
+        # the dimensions is mapped". Force both tensors' Step 3 fallback
+        # onto op_stick_fallback_sym explicitly.
+        injected_dims["topk_stick_fallback_sym"] = op_stick_fallback_sym
     if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
         input_arg = op_spec.args[0]
         output_arg = op_spec.args[-1]

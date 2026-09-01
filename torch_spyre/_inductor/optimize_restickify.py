@@ -60,6 +60,7 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        force_restickify_targets: "dict[SpyreTensorLayout, SpyreTensorLayout] | None" = None,
     ):
         self.dep = dep
         self._op = op
@@ -68,6 +69,15 @@ class EdgeCostMap:
         self._target_dep = target_dep
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
+        # in_stl -> restickify target, applied unconditionally for that in_stl
+        # (against any target_stl), bypassing compute_restickify_needed's
+        # generic stick_compatible() shortcut. Needed when that shortcut's
+        # pairwise symbol-disjointness check produces a false "compatible, no
+        # restickify needed" for a stricter per-op rule -- e.g. topk, where an
+        # individual stick symbol can be forbidden outright (the reduction or
+        # k dim) even though it is disjoint from the target's stick symbols.
+        # See _topk_layouts in propagate_layouts.py.
+        self._force_restickify_targets = force_restickify_targets or {}
 
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
@@ -95,9 +105,13 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
-        needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
-        )
+        forced_target = self._force_restickify_targets.get(in_stl)
+        if forced_target is not None:
+            needed, tgt = True, forced_target
+        else:
+            needed, tgt = compute_restickify_needed(
+                in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            )
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -188,21 +202,27 @@ class AllSameNode(RestickNodeCost):
     """
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_deps, op):
+    def from_args(cls, args, out_layouts, out_deps, op, force_restickify_targets=None):
         """Build an AllSameNode from input PropArgs and output dep(s).
 
         out_deps is either a single MemoryDep (normal ops) or a list whose first
         entry is the primary output dep and whose remaining entries are co-output
         MemoryDeps (e.g. the shared mutation buffer in copy_forced). Co-output deps
         must agree on the same layout but are not eligible for restickify insertion.
+
+        force_restickify_targets: optional list, parallel to args, of
+        {in_stl: target_stl} overrides forwarded to each input's EdgeCostMap
+        (see EdgeCostMap.__init__).
         """
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         if not isinstance(out_deps, list):
             out_deps = [out_deps]
         out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
         co_output_deps = out_deps[1:]
+        force_restickify_targets = force_restickify_targets or [None] * len(args)
         input_edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
+            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op, force)
+            for arg, force in zip(args, force_restickify_targets)
         ]
         output_edge_costs = [
             EdgeCostMap(
