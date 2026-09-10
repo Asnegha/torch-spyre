@@ -1478,6 +1478,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     0,
                 ),
+                # k=8 variant to catch any backend-side assumption that the
+                # reduction dim of a degenerate topk sits last rather than
+                # first (dim=0 here, vs. dim=1/2 for the (1, N)-family above).
+                "2d_nx1_k8_dim0_gt64": (
+                    unique_randn_along_dim((128, 1), dim=0),
+                    8,
+                    0,
+                ),
                 # Reduction dim sandwiched between two size-1 dims.
                 "3d_1xnx1_k4_dim1_lt64": (
                     unique_randn_along_dim((1, 32, 1), dim=1),
@@ -1487,6 +1495,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_1xnx1_k4_dim1_gt64": (
                     unique_randn_along_dim((1, 128, 1), dim=1),
                     4,
+                    1,
+                ),
+                "3d_1xnx1_k8_dim1_gt64": (
+                    unique_randn_along_dim((1, 128, 1), dim=1),
+                    8,
                     1,
                 ),
                 # Every dim is size 1: reduction dim, k dim, and the only
@@ -1505,6 +1518,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
                 "2d_batch1_k4_dim1_lt64": (
                     unique_randn_along_dim((1, 32), dim=1),
+                    4,
+                    1,
+                ),
+                # Degenerate (1, N) case with N > 64: unlike the lt64 variant
+                # above, this needs an actual restickify (multi-stick input ->
+                # synthetic-stick output), so it exercises index correctness
+                # through _topk_force_restickify_target's forced-target path.
+                "2d_batch1_k4_dim1_gt64": (
+                    unique_randn_along_dim((1, 128), dim=1),
                     4,
                     1,
                 ),

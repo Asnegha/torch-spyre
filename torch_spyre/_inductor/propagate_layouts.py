@@ -95,7 +95,12 @@ from .pass_utils import (
     iter_var_id,
     rescale_stl_for_dtype,
 )
-from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
+from .optimize_restickify import (
+    AllSameNode,
+    AnyInNode,
+    FixedInOutNode,
+    _topk_surviving_coords,
+)
 from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
@@ -1643,11 +1648,7 @@ def _topk_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
 
     # Coords that survive the reduction into the output.
-    surviving_coords = [
-        c
-        for c in x_coords
-        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
-    ]
+    surviving_coords = _topk_surviving_coords(x_coords, out_coords)
 
     # Collect candidate output stick dims. A valid input stick passes through;
     # a stick on the reduction var requires a restickify, so every surviving

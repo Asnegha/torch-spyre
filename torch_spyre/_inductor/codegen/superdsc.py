@@ -2030,6 +2030,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     _stick_label,
                 )
 
+    # Set below whenever op_stick_dim is None (pool/conv/generic fallback), but
+    # only ever consumed by the topk branch further down (see
+    # injected_dims["topk_stick_fallback_sym"]) -- other ops recompute their own
+    # per-arg fallback independently in _create_sdsc_tensors's Step 3.
     op_stick_fallback_sym: Symbol | None = None
     if op_stick_dim is None:
         if is_pool or _is_depthwise_conv(op_spec.op):
