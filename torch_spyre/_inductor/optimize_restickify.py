@@ -49,6 +49,19 @@ INF = math.inf
 logger = get_inductor_logger("optimize_restickify")
 
 
+def _topk_surviving_coords(x_coords: list, out_coords: list) -> list:
+    """Return input coordinates that survive topk's reduction into the output.
+
+    A coordinate survives if it has free symbols (varies with a loop var, not
+    a constant) and maps to some dimension in out_coords.
+    """
+    return [
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
+    ]
+
+
 def _topk_force_restickify_target(
     dep: "MemoryDep",
     dep_layout: "FixedLayout",
@@ -67,13 +80,15 @@ def _topk_force_restickify_target(
         return None
     x_coords = host_coordinates(dep_layout, dep, None)
     out_coords = host_coordinates(target_dep_layout, target_dep, None)
-    surviving_coords = [
-        c
-        for c in x_coords
-        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
-    ]
+    surviving_coords = _topk_surviving_coords(x_coords, out_coords)
     if surviving_coords:
         return None
+    # concretize_expr falls back to a size hint for symbolic (dynamic-shape)
+    # exprs rather than raising, so a dynamic-shape dep_layout.size here would
+    # silently bake in a hint instead of the true runtime size. Not currently
+    # exercised: topk's tests only use static shapes, matching this pass's
+    # general assumption elsewhere (e.g. other concretize_expr call sites in
+    # this module make the same simplification).
     x_host_size = [concretize_expr(s) for s in dep_layout.size]
     x_host_stride = [concretize_expr(s) for s in dep_layout.stride]
     return SpyreTensorLayout(
@@ -145,6 +160,23 @@ class EdgeCostMap:
             )
         tgt: "SpyreTensorLayout | None"
         if forced_target is not None:
+            # forced_target does not consult target_stl: it fires whenever
+            # topk's input stick sits on the reduction dim with no surviving
+            # coordinate, and always forces the SAME (None-stick) target
+            # regardless of which target_stl is being costed. This is only
+            # correct because that degenerate shape leaves _topk_layouts with
+            # exactly one output candidate (None-stick) -- so target_stl is
+            # guaranteed to already be that candidate. Assert the invariant
+            # so a future change adding a second topk output candidate fails
+            # loudly here instead of silently shadowing it.
+            target_stick_expr = device_coordinates(target_stl, self._target_dep, None)[
+                -1
+            ]
+            assert not target_stick_expr.free_symbols, (
+                f"topk forced_target fired for {self._op} but target_stl's stick "
+                f"is not synthetic ({target_stick_expr}); forced_target assumes "
+                "topk always has a single None-stick output candidate."
+            )
             needed, tgt = True, forced_target
         else:
             needed, tgt = compute_restickify_needed(

@@ -1595,6 +1595,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     1,
                 ),
+                # Degenerate (1, N) case with N > 64: unlike the lt64 variant
+                # above, this needs an actual restickify (multi-stick input ->
+                # synthetic-stick output), so it exercises index correctness
+                # through _topk_force_restickify_target's forced-target path.
+                "2d_batch1_k4_dim1_gt64": (
+                    unique_randn_along_dim((1, 128), dim=1),
+                    4,
+                    1,
+                ),
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
