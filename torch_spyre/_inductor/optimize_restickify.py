@@ -149,8 +149,14 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
+        # forced_target only fires for target_stl == None-stick: that's the
+        # single output candidate _topk_layouts produces for topk's degenerate
+        # shapes, and the only target forced_target's result is valid for.
+        # Gating on it here (rather than unconditionally, or asserting after
+        # the fact) keeps that coupling explicit at the call site.
+        target_stick_expr = device_coordinates(target_stl, self._target_dep, None)[-1]
         forced_target = None
-        if is_topk(self._op):
+        if is_topk(self._op) and not target_stick_expr.free_symbols:
             forced_target = _topk_force_restickify_target(
                 self.dep,
                 self._dep_layout,
@@ -160,23 +166,6 @@ class EdgeCostMap:
             )
         tgt: "SpyreTensorLayout | None"
         if forced_target is not None:
-            # forced_target does not consult target_stl: it fires whenever
-            # topk's input stick sits on the reduction dim with no surviving
-            # coordinate, and always forces the SAME (None-stick) target
-            # regardless of which target_stl is being costed. This is only
-            # correct because that degenerate shape leaves _topk_layouts with
-            # exactly one output candidate (None-stick) -- so target_stl is
-            # guaranteed to already be that candidate. Assert the invariant
-            # so a future change adding a second topk output candidate fails
-            # loudly here instead of silently shadowing it.
-            target_stick_expr = device_coordinates(target_stl, self._target_dep, None)[
-                -1
-            ]
-            assert not target_stick_expr.free_symbols, (
-                f"topk forced_target fired for {self._op} but target_stl's stick "
-                f"is not synthetic ({target_stick_expr}); forced_target assumes "
-                "topk always has a single None-stick output candidate."
-            )
             needed, tgt = True, forced_target
         else:
             needed, tgt = compute_restickify_needed(
