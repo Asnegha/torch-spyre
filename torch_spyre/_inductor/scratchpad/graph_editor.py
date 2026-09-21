@@ -13,20 +13,26 @@
 # limitations under the License.
 
 from torch.fx.graph import Graph
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch_spyre._inductor.pass_utils import (
+    PerCoreView,
     commit_iteration_space_ownership,
+    commit_tensor_work_division,
     copy_op_metadata,
+    device_coordinates,
     iteration_space_from_op,
     invalidate_op_read_writes,
     op_read_writes,
+    register_operation_after_graph_edit,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
     TensorBox,
     StorageBox,
+    ReinterpretView,
     Buffer,
     Operation,
     Pointwise,
@@ -59,7 +65,7 @@ class GraphEditor:
 
     def _replace_matching_buffer(
         self,
-        buffer: TensorBox | StorageBox | Buffer,
+        buffer: TensorBox | StorageBox | ReinterpretView | Buffer,
         old_name: str,
         i: int,
         new: ComputedBuffer | TensorBox,
@@ -67,13 +73,22 @@ class GraphEditor:
         """If `buffer`'s name matches `old_name`, then replace it with `new` and return True;
         otherwise, do nothing and return False.
 
-        If `buffer` is a `TensorBox` (containing a `StorageBox`) or `StorageBox`, wrap `new` up in
-        the same way. If `new` is a `TensorBox` itself, it is assumed to be wrapped up in an
-        appropriate way."""
+        If `buffer` is a `TensorBox` (containing a `StorageBox`) or
+        `StorageBox`, wrap `new` up in the same way. Preserve a
+        `ReinterpretView` and replace only its underlying storage so that its
+        shape, strides, and offset remain intact. If `new` is a `TensorBox`
+        itself, it is assumed to be wrapped up in an appropriate way."""
         fs = []
+        last_reinterpret_view = None
         while not isinstance(buffer, Buffer):
             if isinstance(buffer, TensorBox):
                 fs.append(TensorBox)
+            elif isinstance(buffer, ReinterpretView):
+                # Keep a graph output's view metadata (shape, strides, and
+                # offset) and replace only the storage it references.  A
+                # trailing view commonly wraps SDPA outputs lowered from
+                # non-contiguous inputs.
+                last_reinterpret_view = buffer
             else:
                 assert isinstance(buffer, StorageBox), (
                     f"unexpected buffer type {type(buffer)} while replacing '{old_name}' ({buffer})"
@@ -82,10 +97,14 @@ class GraphEditor:
             buffer = buffer.data
 
         if buffer.name == old_name:
-            if not isinstance(new, TensorBox):
+            if last_reinterpret_view is not None and not isinstance(new, TensorBox):
+                object.__setattr__(last_reinterpret_view, "data", StorageBox(new))
+            elif not isinstance(new, TensorBox):
                 for f in fs[::-1]:
                     new = f(new)
-            self.lowering.graph_outputs[i] = new
+                self.lowering.graph_outputs[i] = new
+            else:
+                self.lowering.graph_outputs[i] = new
             return True
         else:
             return False
@@ -107,8 +126,11 @@ class GraphEditor:
         *,
         input: bool,
         private: bool = False,
+        lx_view: PerCoreView | None = None,
     ) -> ComputedBuffer:
         """Insert a clone; private clones rewire only ``buffer_users``."""
+        if input and lx_view is None:
+            raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
             buf_name = buffer.data.data.name  # type: ignore
         else:
@@ -176,38 +198,46 @@ class GraphEditor:
         new_com_buf.origin_node = new_fx_node
         copy_op_metadata(metadata_source, new_com_buf)
         new_com_buf.name = self.lowering.register_buffer(new_com_buf)
-        self.lowering.register_operation(new_com_buf)
+        register_operation_after_graph_edit(self.lowering, new_com_buf)
         new_buf_name = new_com_buf.get_name()
 
-        # Clone loops mirror their source/consumer symbols before Scheduler, so
-        # retain direct symbol ownership instead of round-tripping through index
-        # coefficients. A clone has no reduction split.
+        # Clone loops mirror their source/consumer symbols before Scheduler.
+        # Input ownership therefore comes directly from the accepted physical
+        # view; never rebuild its core order from index coefficients.
         metadata_owner = getattr(metadata_source, "iteration_space_ownership", None)
-        if input and metadata_owner is not None:
-            read = next(
-                (
-                    dep
-                    for dep in op_read_writes(metadata_source).reads
-                    if dep.name == buf_name
-                ),
-                None,
+        if input:
+            assert lx_view is not None
+            from torch_spyre._inductor.scratchpad.lx_relayout import (
+                work_division_from_view,
             )
-            clone_write = next(iter(op_read_writes(new_com_buf).writes))
-            by_coeff = {
-                read.index.coeff(sym): split
-                for sym, split in metadata_owner.work_slices.items()
-                if read is not None and read.index.coeff(sym) != 0
-            }
-            clone_splits = {
-                sym: by_coeff.get(clone_write.index.coeff(sym), 1)
-                for sym in iteration_space_from_op(new_com_buf)
-            }
+
+            clone_writes = [
+                dep
+                for dep in op_read_writes(new_com_buf).writes
+                if isinstance(dep, MemoryDep)
+            ]
+            if len(clone_writes) != 1:
+                raise ValueError(
+                    "LX input clone must have exactly one indexed tensor write, "
+                    f"got {len(clone_writes)}"
+                )
+            clone_write = clone_writes[0]
+            clone_space = iteration_space_from_op(new_com_buf)
+            clone_ownership = work_division_from_view(
+                lx_view,
+                clone_layout.device_layout.device_size,
+                device_coordinates(clone_layout.device_layout, clone_write, None),
+                clone_space,
+            )
+            if clone_ownership is None:
+                raise ValueError("LX clone is missing its accepted physical ownership")
+            commit_tensor_work_division(new_com_buf, clone_ownership)
         else:
             clone_splits = {
                 sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
                 for sym in iteration_space_from_op(new_com_buf)
             }
-        commit_iteration_space_ownership(new_com_buf, clone_splits)
+            commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:
             source_users = []
@@ -248,9 +278,15 @@ class GraphEditor:
         self,
         buffer: ComputedBuffer,
         consumers: list[ComputedBuffer],
+        *,
+        lx_view: PerCoreView,
     ) -> ComputedBuffer:
         return self.push_allocation_with_clone(
-            buffer, consumers, input=True, private=True
+            buffer,
+            consumers,
+            input=True,
+            private=True,
+            lx_view=lx_view,
         )
 
     @staticmethod

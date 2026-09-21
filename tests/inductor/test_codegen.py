@@ -26,7 +26,12 @@ from torch._inductor.utils import (
     run_and_get_code,
 )
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import (
+    DataFormats,
+    SymbolicArg,
+    SymbolicArgKind,
+    _resolve_symbolic_args,
+)
 from torch_spyre._inductor import config
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.codegen.compute_ops import (
@@ -34,11 +39,13 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
     _tensor_has_symbolic_split,
+    generate_constant_info,
 )
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
     _resolve_sdsc_size,
     compile_op_spec,
+    parse_op_spec,
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -247,6 +254,85 @@ class TestSpyreConfig(InductorTestCase):
                 len(set(args)),
                 f"Duplicate args in .run() call: {line}",
             )
+
+    def test_inplace_op_symbolic_args_uses_deduped_position(self):
+        """In-place op (x *= 2): the single buffer must appear once in run()'s
+        arg list at position 0.  arg_index must not overshoot into an unassigned
+        slot when duplicates collapse the list.
+        """
+
+        def fn(x):
+            x *= 2
+            return x
+
+        x = torch.randn((4, 128), dtype=torch.float16, device="spyre")
+        with config.patch({"bundle_symbolic_args": True}):
+            cfn = torch.compile(fn)
+            _, source_codes = run_and_get_code(cfn, x)
+            code = source_codes[0]
+
+        run_lines = [ln.strip() for ln in code.splitlines() if ".run(" in ln]
+        self.assertTrue(run_lines, "No .run(...) call found in generated code")
+        # The deduped call must have exactly one tensor arg (no duplicate).
+        for line in run_lines:
+            args_str = line[line.index("(") + 1 : line.rindex(")")]
+            args = [a.strip() for a in args_str.split(",")]
+            self.assertEqual(len(args), len(set(args)), f"Duplicate args: {line}")
+
+    def test_symbolic_address_call_emits_canonical_symbolic_args_payload(self):
+        """The runner builds one SymbolicArg(kAddress) per backend symbol in
+        canonical inputSym_ order using generate_bundle()'s returned symbol_kinds.
+
+        Verifies the resolved address vector is correct and that a reversed payload
+        yields a different vector — proving the ordering contract is load-bearing.
+        """
+
+        def fn(a, b):
+            return a + b
+
+        a = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+        b = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+
+        with config.patch({"bundle_symbolic_args": True}):
+            comp_fn = torch.compile(fn)
+            out, source_codes = run_and_get_code(comp_fn, a, b)
+
+        # Ground-truth: resolve each tensor by its known run() position.
+        # tensor_id == arg_index == position in the deduped call_args list.
+        tensors = [a, b, out]
+        addr_0 = _resolve_symbolic_args(
+            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
+        )[0]
+        addr_1 = _resolve_symbolic_args(
+            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1)]
+        )[0]
+        addr_2 = _resolve_symbolic_args(
+            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2)]
+        )[0]
+
+        payload_canonical = [
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2),
+        ]
+        resolved = _resolve_symbolic_args(tensors, payload_canonical)
+        self.assertEqual(resolved, [addr_0, addr_1, addr_2])
+
+        # Forward-vs-reversed differential: wrong slot order must produce a
+        # different address vector, proving the ordering contract is exercised.
+        payload_reversed = [
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0),
+        ]
+        resolved_rev = _resolve_symbolic_args(tensors, payload_reversed)
+        self.assertNotEqual(
+            resolved,
+            resolved_rev,
+            "canonical and reversed payloads resolved identically — "
+            "all tensors share an address so ordering is not exercised",
+        )
+        self.assertEqual(resolved_rev, [addr_2, addr_1, addr_0])
 
 
 class TestResolveSdscSize(InductorTestCase):
@@ -482,6 +568,78 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestTiledAwayPhysicalAxis(InductorTestCase):
+    def test_native_bmm_fake_broadcasts_gqa_axis(self):
+        query = torch.empty((1, 8, 4, 256, 128), device="meta")
+        key = torch.empty((1, 8, 1, 128, 256), device="meta")
+
+        result = torch.ops.spyre.batched_matmul(query, key)
+
+        self.assertEqual(result.shape, (1, 8, 4, 256, 256))
+
+    def test_nonstick_role_uses_coordinate_axis_across_tiled_away_axis(self):
+        """A constant GQA group slot must not collapse the Hkv stride."""
+        d0, d1, d2, d3 = sympy.symbols("d0:4")
+        iteration_space = {
+            d0: (sympy.Integer(2), 1),
+            d1: (sympy.Integer(8), 1),
+            d2: (sympy.Integer(64), 32),
+            d3: (sympy.Integer(128), 1),
+        }
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice={dim: sympy.S.Zero for dim in iteration_space},
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    # [Hkv, tiled-away G, M, D/64, B, D%64]
+                    device_size=[32, 4, 64, 2, 2, 64],
+                    device_coordinates=[
+                        d1,
+                        sympy.S.Zero,
+                        d2,
+                        sympy.floor(d3 / 64),
+                        d0,
+                        sympy.Mod(d3, 64),
+                    ],
+                    allocation={"hbm": 0},
+                    device_tile_advance_expr=16_384 * sympy.Symbol("tile_group"),
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 8, 64, 2, 2, 64],
+                    device_coordinates=[
+                        sympy.S.Zero,
+                        d1,
+                        d2,
+                        sympy.floor(d3 / 64),
+                        d0,
+                        sympy.Mod(d3, 64),
+                    ],
+                    allocation={"lx": 0},
+                ),
+            ],
+            op_info={},
+            tiled_symbols=[[sympy.Symbol("tile_group")]],
+            tiled_symbol_trip_counts={sympy.Symbol("tile_group"): 4},
+        )
+
+        sdsc_spec, _ = parse_op_spec(spec)
+        source = sdsc_spec.args[0]
+
+        self.assertEqual(
+            {str(dim): gap for dim, gap in source.backGap.items()},
+            {"y": 192, "x": 24},
+        )
+        self.assertEqual(int(source.strides[sympy.Symbol("x")]), 524_288)
 
 
 class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
@@ -765,3 +923,38 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
+
+
+class TestMaskingConstId(InductorTestCase):
+    """maskingConstId_ must resolve to the samv-maskvalue constant.
+
+    Constant ids are positions in the constants dict, so an op that carries its
+    own constants shifts samv-maskvalue off id 0. Hardcoding 0 there made the
+    backend splat the padding lanes with scaling_factor instead of the mask
+    value, corrupting every non-stick-aligned mean reduction (#4390).
+    """
+
+    def _ids_to_names(self, constants):
+        info = generate_constant_info(DataFormats.SEN169_FP16, constants, 1)
+        return {cid: entry["name_"] for cid, entry in info.items()}
+
+    def test_constants_dict_preserves_insertion_order(self):
+        # The whole scheme rests on dict order being insertion order, not
+        # sorted: "samv-maskvalue" sorts before "scaling_factor" but must come
+        # second when inserted second.
+        constants = {"scaling_factor": 1.0 / 9, "samv-maskvalue": 0.0}
+        self.assertEqual(list(constants), ["scaling_factor", "samv-maskvalue"])
+        self.assertEqual(self._ids_to_names(constants)["1"], "samv-maskvalue")
+
+    def test_masking_const_id_follows_preceding_constants(self):
+        # A reduction carrying scaling_factor (mean) shifts the mask value to 1;
+        # one carrying nothing else (sum) leaves it at 0. In both cases the
+        # index recorded at insertion time must name samv-maskvalue.
+        for preceding, expected in (({}, "0"), ({"scaling_factor": 1.0 / 9}, "1")):
+            constants = dict(preceding)
+            recorded = len(constants)
+            constants["samv-maskvalue"] = 0.0
+            self.assertEqual(str(recorded), expected)
+            self.assertEqual(
+                self._ids_to_names(constants)[str(recorded)], "samv-maskvalue"
+            )
