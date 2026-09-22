@@ -27,6 +27,7 @@ from .logging_utils import get_inductor_logger
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    FixedLayout,
     InputBuffer,
     StorageBox,
     TensorBox,
@@ -35,13 +36,62 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
 from .pass_utils import (
     compute_restickify_needed,
+    compute_restickify_target_layout,
     device_coordinates,
+    find_reduction_var,
     host_coordinates,
+    is_topk,
 )
+from .views import matching_dim
 
 INF = math.inf
 
 logger = get_inductor_logger("optimize_restickify")
+
+
+def _topk_surviving_coords(x_coords: list, out_coords: list) -> list:
+    """Return input coordinates that survive topk's reduction into the output.
+
+    A coordinate survives if it has free symbols (varies with a loop var, not
+    a constant) and maps to some dimension in out_coords.
+    """
+    return [
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
+    ]
+
+
+def _topk_force_restickify_target(
+    dep: "MemoryDep",
+    dep_layout: "FixedLayout",
+    in_stl: "SpyreTensorLayout",
+    target_dep: "MemoryDep",
+    target_dep_layout: "FixedLayout",
+) -> "SpyreTensorLayout | None":
+    """Return a forced restickify target for topk's shape-(1, N) case, or None.
+
+    Assumes op is already known to be topk (checked by the caller). Forces
+    the input's stick off the reduction dim when no other dim survives it.
+    """
+    x_device_coords = device_coordinates(in_stl, dep, None)
+    x_stick_expr = x_device_coords[-1]
+    reduction_var = find_reduction_var((dep,), target_dep)
+    if reduction_var not in x_stick_expr.free_symbols:
+        return None
+    x_coords = host_coordinates(dep_layout, dep, None)
+    out_coords = host_coordinates(target_dep_layout, target_dep, None)
+    surviving_coords = _topk_surviving_coords(x_coords, out_coords)
+    if surviving_coords:
+        return None
+    # No real host dim survives the reduction, so there is no existing
+    # coordinate to target -- ask for a synthetic (symbol-free) stick
+    # target. compute_restickify_target_layout's size1_target path handles
+    # both moving to an existing size-1 host dim (case a) and, when none
+    # exists (case b, our situation here), dropping the stick entirely.
+    return compute_restickify_target_layout(
+        in_stl, dep_layout, sympy.S.Zero, x_coords, x_device_coords
+    )
 
 
 class EdgeCostMap:
@@ -96,9 +146,33 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
-        needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
-        )
+        # forced_target only fires for target_stl == None-stick: that's the
+        # single output candidate _topk_layouts produces for topk's degenerate
+        # shapes, and the only target forced_target's result is valid for.
+        # Gating on it here (rather than unconditionally, or asserting after
+        # the fact) keeps that coupling explicit at the call site.
+        target_stick_expr = device_coordinates(target_stl, self._target_dep, None)[-1]
+        forced_target = None
+        if is_topk(self._op) and not target_stick_expr.free_symbols:
+            forced_target = _topk_force_restickify_target(
+                self.dep,
+                self._dep_layout,
+                in_stl,
+                self._target_dep,
+                self._target_dep_layout,
+            )
+        tgt: "SpyreTensorLayout | None"
+        if forced_target is not None:
+            needed, tgt = True, forced_target
+        else:
+            needed, tgt = compute_restickify_needed(
+                in_stl,
+                self._dep_layout,
+                self.dep,
+                target_stl,
+                self._target_dep,
+                self._op,
+            )
         if not needed and self._forbidden_stick_sym is not None:
             stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
             if self._forbidden_stick_sym in stick_expr.free_symbols:

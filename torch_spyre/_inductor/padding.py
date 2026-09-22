@@ -50,6 +50,7 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+from collections import defaultdict
 from typing import Optional
 
 import sympy
@@ -60,6 +61,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -591,7 +593,42 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     )
 
 
-def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
+def _restickify_feeds_own_mutation_target(
+    op: Operation,
+    device_dim: int,
+    unpadded_dim_size,
+    consumers_by_name: "dict[str, list[Operation]]",
+) -> bool:
+    """Return True if op's output is only ever consumed by a mutation copy into
+    a buffer whose own (not-yet-padded) device dim already matches
+    ``unpadded_dim_size`` -- i.e. op's restickify output feeds a sibling step
+    of the same buffer family (e.g. constant_pad_nd's copy-input-data step),
+    not a slice of an unrelated tensor whose layout this pass does not own.
+    """
+    consumers = consumers_by_name.get(op.get_name(), [])
+    if not consumers:
+        return False
+    for consumer in consumers:
+        consumer_layout = getattr(consumer, "layout", None)
+        if not isinstance(consumer_layout, MutationLayoutSHOULDREMOVE):
+            return False
+        target_buf = consumer_layout.get_buffer()
+        target_layout = target_buf.get_layout()
+        target_device_layout = getattr(target_layout, "device_layout", None)
+        if target_device_layout is None:
+            return False
+        if device_dim >= len(target_device_layout.device_size):
+            return False
+        if target_device_layout.device_size[device_dim] != unpadded_dim_size:
+            return False
+    return True
+
+
+def _pad_restickify_output(
+    op: Operation,
+    graph: GraphLowering,
+    consumers_by_name: "dict[str, list[Operation]] | None" = None,
+) -> None:
     """Pad the output dim carrying the input's old stick to a stick boundary, so
     the second+ stick block and every batch plane land at the correct offset.
 
@@ -638,11 +675,31 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     # multiple, then cloning that buffer into the slice.
     host_dim_size = concretize_expr(write_dep.ranges[old_sym])
     if host_dim_size < unpadded_dim_size:
-        raise Unsupported(
-            f"insert_restickify_padding: sliced output on {op.get_name()} "
-            f"(written size {host_dim_size} < device dim size {unpadded_dim_size}) "
-            f"cannot be padded in place"
-        )
+        # The device dim may already have been rounded up to exactly this
+        # host size's stick boundary by an earlier pass (e.g. the restickify
+        # target layout computation) rather than by this function -- that is
+        # not a slice, just padding that already happened.
+        if (
+            unpadded_dim_size == round_up_to_stick(host_dim_size, out_layout.dtype)
+            and compute_padding(unpadded_dim_size, out_layout.dtype) == 0
+        ):
+            return
+        # Or op's output may feed a sibling mutation step of the SAME buffer
+        # family (e.g. constant_pad_nd's own copy-input-data step writing
+        # into its own not-yet-padded output allocation) rather than a slice
+        # of an unrelated tensor whose layout this pass doesn't own. In that
+        # case unpadded_dim_size is this op's own eventual target size, still
+        # correct to grow below.
+        if consumers_by_name is not None and _restickify_feeds_own_mutation_target(
+            op, device_dim, unpadded_dim_size, consumers_by_name
+        ):
+            pass
+        else:
+            raise Unsupported(
+                f"insert_restickify_padding: sliced output on {op.get_name()} "
+                f"(written size {host_dim_size} < device dim size {unpadded_dim_size}) "
+                f"cannot be padded in place"
+            )
 
     # Already a stick multiple: stick blocks land aligned, no padding needed.
     pad = compute_padding(unpadded_dim_size, out_layout.dtype)
@@ -1061,7 +1118,15 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     The restore asserts the prepended gap dim is present before binding the
     symbol, so swapping the pass order fails loudly rather than silently.
     """
-    for op in list(graph.operations):
+    operations = list(graph.operations)
+    consumers_by_name: dict[str, list[Operation]] = defaultdict(list)
+    for consumer in operations:
+        for dep in consumer.get_read_writes().reads:
+            name = getattr(dep, "name", None)
+            if name is not None:
+                consumers_by_name[name].append(consumer)
+
+    for op in operations:
         if is_restickify_op(op, graph):
-            _pad_restickify_output(op, graph)
+            _pad_restickify_output(op, graph, consumers_by_name)
             _pad_restickify_input(op, graph)

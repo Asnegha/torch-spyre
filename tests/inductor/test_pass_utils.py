@@ -15,7 +15,10 @@
 import types
 
 import sympy
+import torch
 from torch._inductor.dependencies import MemoryDep, WeakDep
+from torch._inductor.ir import FixedLayout
+from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.pass_utils as pass_utils
 
@@ -65,3 +68,46 @@ def test_late_operation_registration_does_not_reuse_a_removed_slot():
     assert graph.operations[-1] is inserted
     assert graph.name_to_op["op3"] is old_ops[3]
     assert graph.name_to_op["op4"] is inserted
+
+
+def test_compute_restickify_target_layout_moves_to_existing_size1_dim():
+    """Case (a): an existing size-1 host dim hosts the stick, no synthesis needed."""
+    d1 = sympy.Symbol("d1")
+    host_layout = FixedLayout(torch.device("spyre"), torch.float16, [1, 64], [64, 1])
+    # Host coords: dim0 is the constant size-1 dim, dim1 varies with d1.
+    ic = [sympy.S.Zero, d1]
+    # Device layout with the stick currently on dim1 (idc[-1] == d1); the
+    # outer dim's coordinate is the same constant as the host's size-1 dim.
+    stl = SpyreTensorLayout([1, 64], [64, 1], torch.float16, [0, 1])
+    idc = [sympy.S.Zero, d1]
+
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host_layout, sympy.S.Zero, ic, idc
+    )
+
+    assert result is not None
+    # The stick actually moved: the leading device dim goes from a size-1
+    # placeholder (stl's old outer slot for the size-1 host dim) to the
+    # elems-per-stick extent, reflecting the restickify onto that dim.
+    assert stl.device_size[0] == 1
+    assert result.device_size[0] == 64
+
+
+def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists():
+    """Case (b): no size-1 host dim exists, so the stick is dropped entirely."""
+    d0, d1 = sympy.symbols("d0 d1")
+    host_layout = FixedLayout(torch.device("spyre"), torch.float16, [4, 64], [64, 1])
+    ic = [d0, d1]
+    stl = SpyreTensorLayout([4, 64], [64, 1], torch.float16, [0, 1])
+    idc = [d0, d1]
+
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host_layout, sympy.S.Zero, ic, idc
+    )
+
+    assert result is not None
+    # No stick assigned: the fallback returns exactly the host tensor's own
+    # size/stride with dim_order ending in -1 (no dim is fabricated).
+    expected = SpyreTensorLayout([4, 64], [64, 1], torch.float16, [0, 1, -1])
+    assert result.device_size == expected.device_size
+    assert result.stride_map == expected.stride_map
