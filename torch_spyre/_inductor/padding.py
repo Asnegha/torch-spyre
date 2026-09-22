@@ -638,6 +638,17 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     # multiple, then cloning that buffer into the slice.
     host_dim_size = concretize_expr(write_dep.ranges[old_sym])
     if host_dim_size < unpadded_dim_size:
+        # The device dim may already have been rounded up to exactly this
+        # host size's stick boundary by an earlier pass (e.g. the restickify
+        # target layout computation) rather than by this function -- that is
+        # not a slice, just padding that already happened. Only a gap wider
+        # than the expected rounding (or a device dim not itself stick
+        # aligned) indicates a genuine slice into a base tensor we don't own.
+        if (
+            unpadded_dim_size == round_up_to_stick(host_dim_size, out_layout.dtype)
+            and compute_padding(unpadded_dim_size, out_layout.dtype) == 0
+        ):
+            return
         raise Unsupported(
             f"insert_restickify_padding: sliced output on {op.get_name()} "
             f"(written size {host_dim_size} < device dim size {unpadded_dim_size}) "
