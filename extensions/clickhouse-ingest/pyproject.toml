@@ -19,3 +19,22 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+
+# Named explicitly, not auto-discovered: `schema/` sits beside the package as a sibling
+# directory, and flat-layout autodiscovery counts it as a second top-level package and refuses
+# to build ("Multiple top-level packages discovered"). That breaks `pip install` outright,
+# including the `git+https://...#subdirectory=extensions/clickhouse-ingest` form the other repos
+# install with. The .sql files are data applied against a server, never imported.
+#
+# The DDL must travel with the installed package: apply_schema is the only thing that creates
+# these tables, and an install without the .sql files made it find zero of them and report
+# success. `schema` is therefore listed as a subpackage mapped from the sibling directory --
+# it holds no .py and is never imported, it is named here purely so the data installs.
+[tool.setuptools]
+packages = ["spyre_clickhouse_ingest", "spyre_clickhouse_ingest.schema"]
+
+[tool.setuptools.package-dir]
+"spyre_clickhouse_ingest.schema" = "schema"
+
+[tool.setuptools.package-data]
+"spyre_clickhouse_ingest.schema" = ["*.sql"]

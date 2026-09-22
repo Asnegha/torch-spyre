@@ -25,16 +25,15 @@ The table name is a parameter everywhere: the ingest exposes --table, and hardco
 dedup query while honouring the flag elsewhere made that flag a half-truth.
 """
 
-import sys
-
 # Column names — must match build_row() order and hw_failure_diagnostics DDL
 HW_COLUMN_NAMES = (
-    # Identity
+    # Identity. No workflow/branch/commit_sha/run_link: the first IS the test_type (a run_id
+    # hash input), the last is derivable from run_id, and the middle two are run-level facts
+    # that never varied per row (0 of 6,090 prod run_ids carried two values of any of them).
     "run_id",
-    "workflow",
-    "branch",
-    "commit_sha",
-    "run_link",
+    "artifact_id",
+    "component",
+    "arch",
     "suite_name",
     "attempt",
     "total_attempts",
@@ -78,46 +77,29 @@ HW_COLUMN_NAMES = (
     "tests_error",
     # Stall
     "stall_max_secs",
+    # external_run_id (the raw coordinate run_id is hashed from) and run_url.
+    "props",
 )
 
-# Columns absent from older deployments of this table. ADD COLUMN IF NOT EXISTS is idempotent,
-# so this runs on every ingest and is the only migration path this table has.
-EXTRA_COLUMNS = (
-    ("workflow", "LowCardinality(String) DEFAULT ''"),
-    ("branch", "LowCardinality(String) DEFAULT ''"),
-    ("commit_sha", "String DEFAULT ''"),
-    ("run_link", "String DEFAULT ''"),
-    ("failure_reason_detail", "String DEFAULT '{}'"),
-    ("ras_category", "LowCardinality(String) DEFAULT ''"),
-    ("ras_severity", "LowCardinality(String) DEFAULT ''"),
-    ("ras_message", "String DEFAULT ''"),
-    ("ras_events_json", "String DEFAULT '[]'"),
-    # True when the row came from a pod-level-retry job (a fresh-pod re-run), not the original.
-    ("pod_level_retry", "Bool DEFAULT false"),
-)
+NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
 DEFAULT_TABLE = "hw_failure_diagnostics"
 
 
 def already_ingested(
-    client, run_id: str, workflow: str, table: str = DEFAULT_TABLE
+    client, run_id: str, component: str, table: str = DEFAULT_TABLE
 ) -> bool:
-    """True when this (run_id, workflow) pair already has rows, so a re-run does not double-insert."""
+    """True when this (component, run_id) pair already has rows, so a re-run does not
+    double-insert.
+
+    Keyed on the sort-key prefix, which is what makes it cheap: the v1 table was created
+    unsorted and this one query read every row (measured 840,032 of 840,032 on prod). It
+    previously filtered (run_id, workflow); workflow is gone, being the test_type that run_id
+    is already hashed from.
+    """
     result = client.query(
         f"SELECT count() FROM {table} "
-        "WHERE run_id = {run_id:String} AND workflow = {workflow:String}",
-        parameters={"run_id": run_id, "workflow": workflow},
+        "WHERE component = {component:String} AND run_id = {run_id:UUID}",
+        parameters={"run_id": run_id, "component": component},
     )
     return result.result_rows[0][0] > 0
-
-
-def ensure_extra_columns(client, table: str = DEFAULT_TABLE) -> None:
-    """Add any missing EXTRA_COLUMNS. Non-fatal per column: the usual cause is that it already
-    exists, and a failure here must not cost the run its rows."""
-    for col_name, col_type in EXTRA_COLUMNS:
-        try:
-            client.command(
-                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-            )
-        except Exception as exc:
-            print(f"  [warn] Could not add column {col_name}: {exc}", file=sys.stderr)

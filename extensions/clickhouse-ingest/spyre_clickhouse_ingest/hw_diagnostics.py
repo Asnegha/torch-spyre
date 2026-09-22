@@ -27,15 +27,28 @@ from pathlib import Path
 from .hw_schema import DEFAULT_TABLE, HW_COLUMN_NAMES
 
 
+NIL_UUID = "00000000-0000-0000-0000-000000000000"
+
+
 @dataclass(frozen=True)
 class RunContext:
-    """The run coordinates the parsed records do not carry themselves."""
+    """The run coordinates the parsed records do not carry themselves.
 
-    run_id: str = ""
-    workflow: str = ""
-    branch: str = ""
-    sha: str = ""
-    run_link: str = ""
+    `run_id` is the DERIVED uuid that joins artifact_results, not the producer's raw coordinate --
+    that is `external_run_id`, a hash input, kept in props. artifact_id defaults to the nil UUID
+    so an un-updated caller writes "not linked" rather than a hash that would join everything.
+
+    No workflow/branch/sha/run_link: the first is the test_type run_id is already hashed from, the
+    last is derivable from run_id, and the middle two are run-level facts that never varied per
+    row.
+    """
+
+    run_id: str = NIL_UUID
+    artifact_id: str = NIL_UUID
+    component: str = ""
+    arch: str = ""
+    external_run_id: str = ""
+    run_url: str = ""
 
 
 def _parse_ts(ts_str: str) -> datetime | None:
@@ -81,11 +94,10 @@ def build_row(rec: dict, ctx: RunContext) -> list:
     """
     return [
         # ── Identity ──────────────────────────────────────────────────────
-        _str(rec.get("run_id") or ctx.run_id),
-        _str(ctx.workflow),
-        _str(ctx.branch),
-        _str(ctx.sha)[:40].ljust(40)[:40],  # normalise to ≤40 chars
-        _str(ctx.run_link),
+        _str(ctx.run_id) or NIL_UUID,
+        _str(ctx.artifact_id) or NIL_UUID,
+        _str(ctx.component),
+        _str(ctx.arch),
         _str(rec.get("suite_name")),
         _int(rec.get("attempt"), 1),
         _int(rec.get("total_attempts"), 1),
@@ -130,6 +142,17 @@ def build_row(rec: dict, ctx: RunContext) -> list:
         _int(rec.get("tests_error")),
         # ── Stall info ────────────────────────────────────────────────────
         _int(rec.get("stall_max_secs")),
+        # The run_id hash inputs, kept so a row stays traceable to the producer coordinate it
+        # was derived from. The record's own run_id wins: one JSON file is one run, but a
+        # re-ingest may be pointed at a file whose coordinate differs from the flag.
+        {
+            k: v
+            for k, v in (
+                ("external_run_id", _str(rec.get("run_id") or ctx.external_run_id)),
+                ("run_url", _str(ctx.run_url)),
+            )
+            if v
+        },
     ]
 
 

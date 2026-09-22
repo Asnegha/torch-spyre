@@ -45,6 +45,15 @@ jobs:
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha   || github.sha }}
       TRIGGERING_RUN_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id || inputs.gha_run_id }}
 
+      INGEST_COMPONENT: torch-spyre
+      # The arch of the ANALYSED legs, not of this ingest job -- so never $(uname -m), which
+      # would report the ingest runner. Literal x86_64 because every leg this workflow follows
+      # runs on the x86 pool today (all 30 node_names in prod are p1-worker-*, the x86 ARC
+      # runners). arch is a run_id hash input, so when a p/z leg starts feeding this ingest the
+      # value MUST come from the parsed record instead: a wrong arch derives a run_id that joins
+      # nothing, silently. parse_hw_failures.py does not capture arch yet.
+      LEG_ARCH: x86_64
+
     steps:
       - name: Checkout scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -188,13 +197,16 @@ jobs:
       - name: Ingest Logs Report into ClickHouse
         run: |
           source .venv/bin/activate
+          # --trigger-type carries what --workflow used to: the triggering workflow's name IS
+          # the tier, and the tier is a run_id hash input. --gha-run-id is the coordinate that
+          # run_id is derived FROM, not run_id itself.
           python3 .github/scripts/ingest_hw_diagnostics.py \
-            --json-file "${JSON_FILE}" \
-            --workflow  "${TRIGGERING_WORKFLOW}" \
-            --branch    "${TRIGGERING_BRANCH}" \
-            --sha       "${TRIGGERING_SHA}" \
-            --run-id    "${TRIGGERING_RUN_ID}" \
-            --run-link  "${TRIGGERING_RUN_LINK}"
+            --json-file    "${JSON_FILE}" \
+            --component    "${INGEST_COMPONENT}" \
+            --arch         "${LEG_ARCH}" \
+            --trigger-type "${TRIGGERING_WORKFLOW}" \
+            --gha-run-id   "${TRIGGERING_RUN_ID}" \
+            --run-url      "${TRIGGERING_RUN_LINK}"
 
       - name: Upload JSON artifact
         if: always()

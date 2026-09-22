@@ -5,24 +5,26 @@ into ClickHouse (hw_failure_diagnostics table).
 
 Usage (called by the GHA workflow):
     python3 ingest_hw_diagnostics.py \
-        --json-file hw_diagnostics_tests_74526099734.json \
-        --workflow  "tests" \
-        --branch    "main" \
-        --sha       "abc123..." \
-        --run-id    "74526099734" \
-        --run-link  "https://github.com/org/repo/actions/runs/74526099734"
+        --json-file    hw_diagnostics_tests_74526099734.json \
+        --component    torch-spyre \
+        --arch         x86_64 \
+        --trigger-type regression \
+        --gha-run-id   74526099734 \
+        --run-url      "https://github.com/org/repo/actions/runs/74526099734"
 
 The parse/ingest logic lives in spyre_clickhouse_ingest (extensions/clickhouse-ingest) so the
 product repos share one definition; this file is the CLI around it.
 """
 
 import argparse
+import platform as _platform
 import sys
 from collections import Counter
 from pathlib import Path
 
 from spyre_clickhouse_ingest.client import client_summary, get_client
 from spyre_clickhouse_ingest.hw_diagnostics import (
+    NIL_UUID,
     RunContext,
     _str,
     build_row,
@@ -30,11 +32,12 @@ from spyre_clickhouse_ingest.hw_diagnostics import (
     insert_rows,
     load_records,
 )
-from spyre_clickhouse_ingest.hw_schema import (
-    DEFAULT_TABLE,
-    already_ingested,
-    ensure_extra_columns,
+from spyre_clickhouse_ingest.identity import (
+    canonical_arch,
+    component_of,
+    run_id_for,
 )
+from spyre_clickhouse_ingest.hw_schema import DEFAULT_TABLE, already_ingested
 
 
 def main() -> None:
@@ -49,24 +52,50 @@ def main() -> None:
         help="Path to JSON file produced by parse_hw_failures.py",
     )
     parser.add_argument(
-        "--workflow", default="", help="Originating GHA workflow name (e.g. 'tests')"
-    )
-    parser.add_argument("--branch", default="", help="Git branch name (e.g. 'main')")
-    parser.add_argument("--sha", default="", help="Git commit SHA")
-    parser.add_argument(
-        "--run-id",
-        default="",
-        help="GHA run ID — used as run_id if JSON records lack one",
-    )
-    parser.add_argument(
-        "--run-link",
-        default="",
-        help="URL to the triggering GHA run (e.g. '<server>/<repo>/actions/runs/<id>')",
-    )
-    parser.add_argument(
         "--table",
         default=DEFAULT_TABLE,
         help=f"Target ClickHouse table (default: {DEFAULT_TABLE})",
+    )
+    # run_id is DERIVED, never passed as a coordinate: --run-id carries the threaded uuid when
+    # the orchestrator minted one, and the flags below supply the hash inputs when it did not.
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Threaded run uuid from the orchestrator, when one was minted",
+    )
+    parser.add_argument(
+        "--component",
+        default="",
+        help="Component whose suite this is (default: torch-spyre)",
+    )
+    parser.add_argument(
+        "--arch",
+        default=_platform.machine(),
+        help="Arch of this leg; amd64 folds to x86_64 (default: this machine's)",
+    )
+    parser.add_argument(
+        "--gha-run-id", default="", help="GHA run id, when GHA dispatched this leg"
+    )
+    parser.add_argument(
+        "--jenkins-run-key",
+        default="",
+        help="Jenkins externalizable id ('folder/job#123'), when Jenkins dispatched this leg",
+    )
+    parser.add_argument(
+        "--trigger-type",
+        default="",
+        help="Test tier of this leg (regression | trunk | perf | ...). Replaces --workflow, "
+        "which carried the same value: it is the test_type run_id is hashed from.",
+    )
+    parser.add_argument(
+        "--run-url",
+        default="",
+        help="URL of the CI run behind these rows; kept in props, not a column",
+    )
+    parser.add_argument(
+        "--artifact-id",
+        default="",
+        help="artifact_id of the image this leg ran, read from its OCI label / in-image file",
     )
     args = parser.parse_args()
 
@@ -95,25 +124,40 @@ def main() -> None:
     client.command("SELECT 1")
     print("[info] Connected.\n")
 
-    ensure_extra_columns(client, table=args.table)
-
-    # One JSON file is one run, so the first record's run_id represents the batch.
-    run_id = _str(records[0].get("run_id") or args.run_id)
-    workflow = _str(args.workflow)
-
-    if already_ingested(client, run_id, workflow, table=args.table):
+    # One JSON file is one run, so the first record's coordinate represents the batch. It is a
+    # hash INPUT, not the run_id: --gha-run-id is the flag form of the same value.
+    external_run_id = _str(records[0].get("run_id") or args.gha_run_id)
+    arch = canonical_arch(args.arch)
+    component = component_of(args)
+    # Same two-case rule as every other writer: the threaded uuid when one was supplied, else
+    # the hash of this leg's own CI coordinate.
+    run_id = run_id_for(args, external_run_id, arch, args.trigger_type)
+    if not run_id:
+        # Coercing this to a fixed sentinel (NIL_UUID) would make every underivable run
+        # collide with every other one in the dedup check below, silently dropping runs
+        # that never touched each other. Fail loudly instead.
         print(
-            f"[info] run_id={run_id!r} workflow={workflow!r} already ingested "
+            f"[error] run_id not derivable (external_run_id={external_run_id!r} "
+            f"arch={arch!r} trigger_type={args.trigger_type!r}); "
+            "--trigger-type is the flag usually missing.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if already_ingested(client, run_id, component, table=args.table):
+        print(
+            f"[info] run_id={run_id} component={component!r} already ingested "
             f"— skipping. Re-run with a different table or clear the existing rows."
         )
         sys.exit(0)
 
     ctx = RunContext(
-        run_id=args.run_id,
-        workflow=args.workflow,
-        branch=args.branch,
-        sha=args.sha,
-        run_link=args.run_link,
+        run_id=run_id,
+        artifact_id=_str(args.artifact_id) or NIL_UUID,
+        component=component,
+        arch=arch,
+        external_run_id=external_run_id,
+        run_url=args.run_url,
     )
 
     rows = []
@@ -147,10 +191,10 @@ def main() -> None:
     outcomes: Counter = Counter(_str(r.get("outcome"), "unknown") for r in records)
 
     print(f"\n[info] Successfully inserted {len(rows)} row(s) into {args.table}")
-    print(f"[info]   run_id   : {run_id}")
-    print(f"[info]   workflow : {workflow}")
-    print(f"[info]   branch   : {args.branch}")
-    print(f"[info]   sha      : {args.sha[:12]}")
+    print(f"[info]   run_id     : {ctx.run_id}")
+    print(f"[info]   external   : {ctx.external_run_id} (tier {args.trigger_type!r})")
+    print(f"[info]   component  : {ctx.component}  arch: {ctx.arch}")
+    print(f"[info]   artifact_id: {ctx.artifact_id}")
     print()
     print("[info] Outcomes:")
     for outcome, n in sorted(outcomes.items()):

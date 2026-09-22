@@ -207,26 +207,20 @@ def test_build_row_matches_the_column_count():
     assert len(row) == len(HW_COLUMN_NAMES)
 
 
-def test_dedup_and_migration_honour_the_table_argument():
-    from spyre_clickhouse_ingest.hw_schema import already_ingested, ensure_extra_columns
+def test_dedup_honours_the_table_argument():
+    from spyre_clickhouse_ingest.hw_schema import already_ingested
 
     class FakeClient:
         def __init__(self):
             self.queries = []
-            self.commands = []
 
         def query(self, sql, parameters=None):
             self.queries.append(sql)
             return types.SimpleNamespace(result_rows=[[0]])
 
-        def command(self, sql):
-            self.commands.append(sql)
-
     client = FakeClient()
     already_ingested(client, "r", "w", table="scratch_hw")
-    ensure_extra_columns(client, table="scratch_hw")
     assert "FROM scratch_hw" in client.queries[0]
-    assert all("ALTER TABLE scratch_hw" in c for c in client.commands)
 
 
 # ── one definition, not a copy ────────────────────────────────────────────────────────────
@@ -241,7 +235,7 @@ def test_scripts_use_the_shared_library_not_a_local_copy(parse_script, ingest_sc
         assert getattr(parse_script, name) is getattr(hw_parse, name), name
     for name in ("build_row", "filter_suite_records", "insert_rows", "load_records"):
         assert getattr(ingest_script, name) is getattr(hw_diagnostics, name), name
-    for name in ("already_ingested", "ensure_extra_columns"):
+    for name in ("already_ingested",):
         assert getattr(ingest_script, name) is getattr(hw_schema, name), name
     # Pins the deleted duplicate: this script had its own copy of get_client.
     assert ingest_script.get_client is client.get_client

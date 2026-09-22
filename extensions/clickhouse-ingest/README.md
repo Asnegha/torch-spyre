@@ -41,9 +41,9 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | module | contents |
 |---|---|
 | `schema.py` | the table model: columns, order, DDL CHECK sets, `qualified()`, dep-entry helpers |
-| `identity.py` | `v2_run_id`, `v2_test_case_id`, `v2_component`, `v2_canonical_arch` |
-| `client.py` | `get_client`, `v2_database`, `v2_tables_present` |
-| `v2_writer.py` | `insert_v2`, `v2_already_ingested` |
+| `identity.py` | `run_id_of`, `case_id_for`, `component_of`, `canonical_arch` |
+| `client.py` | `get_client`, `target_database`, `tables_present` |
+| `writer.py` | `insert_test_results`, `cases_already_ingested` |
 | `junit.py` | JUnit helpers + CI run-coordinate resolution |
 | `hw_parse.py` | GHA log → `hw_failure_diagnostics` records (RAS events, phases, pytest counts) |
 | `hw_schema.py` | `hw_failure_diagnostics` columns + its `ADD COLUMN IF NOT EXISTS` migration |
