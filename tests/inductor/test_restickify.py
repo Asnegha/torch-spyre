@@ -1211,15 +1211,12 @@ def test_amax_full_and_amax_live_maximum():
     _compare(f, t, optimal_cost=0)
 
 
-# ------- Unsupported stick configurations ---------
-
-
 def test_sparse_dense_pointwise():
     """a.sum(-1) + b - reduction followed by pointwise without broadcasting."""
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
 
-    _compare(lambda a, b: a.amin(-1) + b, a, b)
+    _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
 # ------- Restickify padding: strided input raises Unsupported ---------
@@ -2211,14 +2208,14 @@ def test_2d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S)
 
 
 def test_3d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
 
 
 def test_sparse_dense_pointwise_d0_stick():
@@ -2227,8 +2224,13 @@ def test_sparse_dense_pointwise_d0_stick():
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
-    b_dev = b.to(device_layout=b_layout)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, device_args=[a.to(DEVICE), b_dev])
+
+    _compare(
+        lambda a, b: a.amin(-1)[0] + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b.to(device_layout=b_layout)],
+    )
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():
