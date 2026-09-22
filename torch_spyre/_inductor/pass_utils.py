@@ -2169,6 +2169,21 @@ def compute_restickify_target_layout(
     else:
         new_sd = matching_dim(ic, target_stick_expr)
     if new_sd is None:
+        if size1_target:
+            # No real size-1 host dim exists to host the stick (e.g. every
+            # non-reduced dim is itself the target of a reduction, as with
+            # topk on shape (1, N)). Rather than fabricate a new device
+            # dimension -- which the DDL/codegen layer has been found to
+            # reject for a stick pinned to any size-1 dim, real or
+            # synthetic -- drop the stick entirely: return a layout that
+            # matches the host tensor's own size/stride with no stick
+            # assigned (dim_order ending in -1).
+            return SpyreTensorLayout(
+                host_size,
+                host_stride,
+                host_layout.dtype,
+                list(range(len(host_size))) + [-1],
+            )
         return None
     old_sd = matching_dim(ic, idc[-1])
     if old_sd is None:

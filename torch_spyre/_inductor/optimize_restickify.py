@@ -36,7 +36,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
 from .pass_utils import (
     compute_restickify_needed,
-    concretize_expr,
+    compute_restickify_target_layout,
     device_coordinates,
     find_reduction_var,
     host_coordinates,
@@ -74,7 +74,8 @@ def _topk_force_restickify_target(
     Assumes op is already known to be topk (checked by the caller). Forces
     the input's stick off the reduction dim when no other dim survives it.
     """
-    x_stick_expr = device_coordinates(in_stl, dep, None)[-1]
+    x_device_coords = device_coordinates(in_stl, dep, None)
+    x_stick_expr = x_device_coords[-1]
     reduction_var = find_reduction_var((dep,), target_dep)
     if reduction_var not in x_stick_expr.free_symbols:
         return None
@@ -83,19 +84,13 @@ def _topk_force_restickify_target(
     surviving_coords = _topk_surviving_coords(x_coords, out_coords)
     if surviving_coords:
         return None
-    # concretize_expr falls back to a size hint for symbolic (dynamic-shape)
-    # exprs rather than raising, so a dynamic-shape dep_layout.size here would
-    # silently bake in a hint instead of the true runtime size. Not currently
-    # exercised: topk's tests only use static shapes, matching this pass's
-    # general assumption elsewhere (e.g. other concretize_expr call sites in
-    # this module make the same simplification).
-    x_host_size = [concretize_expr(s) for s in dep_layout.size]
-    x_host_stride = [concretize_expr(s) for s in dep_layout.stride]
-    return SpyreTensorLayout(
-        x_host_size,
-        x_host_stride,
-        dep_layout.dtype,
-        list(range(len(x_host_size))) + [-1],
+    # No real host dim survives the reduction, so there is no existing
+    # coordinate to target -- ask for a synthetic (symbol-free) stick
+    # target. compute_restickify_target_layout's size1_target path handles
+    # both moving to an existing size-1 host dim (case a) and, when none
+    # exists (case b, our situation here), dropping the stick entirely.
+    return compute_restickify_target_layout(
+        in_stl, dep_layout, sympy.S.Zero, x_coords, x_device_coords
     )
 
 
