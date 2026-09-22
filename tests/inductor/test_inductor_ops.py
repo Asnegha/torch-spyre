@@ -1472,6 +1472,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_sort", "test_sort_cpu"): {
+            "param_sets": {
+                # dim=0: the non-stick dim of a 2-D tensor -- supported for
+                # both float16 and float32.
+                "2d_dim0_fp16": (unique_randn_along_dim((64, 64), dim=0), 0),
+                "2d_dim0_fp32": (
+                    unique_randn_along_dim((64, 64), dim=0, dtype=torch.float32),
+                    0,
+                ),
+                # dim=1 / dim=-1: the stick dim -- float16 only (float32
+                # raises Unsupported here, see test_sort_float32_stick_dim_
+                # rejected below).
+                "2d_dim1_fp16": (unique_randn_along_dim((8, 64), dim=1), 1),
+                "2d_dim_minusone_fp16": (
+                    unique_randn_along_dim((8, 64), dim=-1),
+                    -1,
+                ),
+                "3d_dim1_fp16": (
+                    unique_randn_along_dim((4, 64, 8), dim=1),
+                    1,
+                ),
+                # Not a multiple of the 64-element stick size.
+                "2d_dim0_non_multiple_of_64": (
+                    unique_randn_along_dim((100, 8), dim=0),
+                    0,
+                ),
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -6899,6 +6927,62 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
+
+    def test_sort_cpu(self, x, dim: int):
+        # torch.sort(stable=True) returns (values, indices); only compare
+        # values since topkindex's hardware tie-break order for tied values
+        # doesn't match stable=True's contract yet (see issue #4500). Uses
+        # unique_randn_along_dim, which avoids ties entirely, so this test
+        # doesn't exercise that gap either way.
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, stable=True)[0], x, run_eager=False
+        )
+
+    def test_sort_descending_cpu(self):
+        x = unique_randn_along_dim((8, 64), dim=1)
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=1, descending=True, stable=True)[0],
+            x,
+            run_eager=False,
+        )
+
+    def test_sort_values_stable_out_cpu(self):
+        # Exercises aten::sort.values_stable directly (the out= overload),
+        # which is the exact overload issue #4500 reported as unregistered.
+        x = unique_randn_along_dim((8, 64), dim=1)
+
+        def fn(x):
+            values = torch.empty_like(x)
+            indices = torch.empty(x.shape, dtype=torch.int64, device=x.device)
+            torch.ops.aten.sort.values_stable(
+                x, stable=True, dim=1, descending=False, values=values, indices=indices
+            )
+            return values
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_sort_dim_too_large_rejected(self):
+        # spyre_sort delegates to topkvalue/topkindex with k == dim size;
+        # k > 128 is rejected the same way spyre_topk rejects it.
+        x = unique_randn_along_dim((2, 200), dim=1)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.sort(x, dim=1, stable=True)[0],
+                [x],
+                "spyre",
+            )
+
+    def test_sort_float32_stick_dim_rejected(self):
+        # float32 sort along the last (stick) dim hits a topkvalue/topkindex
+        # stick-format limitation independent of this decomposition -- see
+        # issue #4500's investigation. Must raise cleanly, not crash.
+        x = unique_randn_along_dim((8, 64), dim=1, dtype=torch.float32)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.sort(x, dim=1, stable=True)[0],
+                [x],
+                "spyre",
+            )
 
     def test_topk_largest_false_rejected(self):
         # largest=False cannot be served by the topkvalue/topkindex reduction

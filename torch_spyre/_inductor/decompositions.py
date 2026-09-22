@@ -1256,6 +1256,111 @@ def spyre_topk(
     )
 
 
+# Registered on all four overloads (``default``, ``stable``, ``values``,
+# ``values_stable``) -- see issue #4500. A PrivateUse1 kernel installed
+# directly on ``default``/``stable`` pre-empts aten's
+# CompositeExplicitAutogradNonFunctional wrapper for those overloads (the one
+# that would otherwise allocate outputs and re-dispatch into
+# ``sort.values_stable``). But ``values``/``values_stable`` are reached
+# directly by ``torch.sort(..., out=(values, indices))`` and by any caller
+# that invokes ``torch.ops.aten.sort.values_stable`` explicitly -- both call
+# forms bypass ``default``/``stable`` entirely, so they need their own
+# PrivateUse1 kernel too (confirmed: without this, both still raised the
+# exact NotImplementedError from #4500's report even with the functional
+# overloads covered).
+@register_spyre_decompositions(
+    [torch.ops.aten.sort.default, torch.ops.aten.sort.stable]
+)
+def spyre_sort(
+    input: torch.Tensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ndim = input.dim()
+    norm_dim = dim % ndim if ndim else 0
+    n = input.size(norm_dim) if ndim else 1
+    if n > 128:
+        raise Unsupported(f"sort along a dim of size {n} is not supported (max 128)")
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise Unsupported(
+            f"sort is not supported for dtype {input.dtype} (only float16 "
+            "and float32 are currently supported)"
+        )
+    # float32 only works when the sort dim ISN'T the stick dim (the last
+    # dim; a 1-D tensor's only dim is always the stick dim). ReStickifyOpHBM
+    # (needed for the degenerate-shape case, e.g. 1-D) only supports the
+    # native SEN169_FP16 device format, and the topk reduction itself hits a
+    # separate stick-incompatibility gap when its reduction dim is the last
+    # (stick) dim for float32. Confirmed directly: float32 topk on a
+    # non-stick dim (e.g. dim=0 of a 2-D tensor) works and matches CPU;
+    # float32 on the stick dim raises "no mechanism to resolve stick
+    # incompatibility" in the topk reduction before this decomposition can
+    # do anything about it. Neither gap is something this decomposition can
+    # route around, so raise cleanly here instead of emitting a graph that
+    # fails deep in codegen.
+    if input.dtype == torch.float32 and norm_dim == ndim - 1:
+        raise Unsupported(
+            "sort is not supported for float32 along the last (stick) dim"
+        )
+    # KNOWN GAP (see issue #4500): a degenerate shape -- a 1-D tensor, or any
+    # shape where the reduction dim is the tensor's only non-trivial axis --
+    # currently fails with "AllSameNode.from_args: out_layouts is empty".
+    # spyre.topkvalue/topkindex's layout propagation doesn't yet have a
+    # fallback output layout for that case; fixing it is a separate,
+    # standalone compiler fix (tracked upstream as PRs #4015/#4461 for the
+    # analogous topk degenerate-shape bug -- not yet merged into main as of
+    # this commit) rather than something specific to this decomposition.
+    # spyre.topkvalue/topkindex only ever extract the *largest* k elements
+    # (see spyre_topk above -- largest=False isn't supported there either).
+    # A descending sort is exactly "topk with k == n". An ascending sort is
+    # the same operation on the negated input: negation is an exact,
+    # order-reversing bijection on IEEE floats, so the smallest original
+    # values become the largest negated ones. Negate the values back
+    # afterwards; the indices don't get negated, they're positions.
+    #
+    # NOTE: topkindex's hardware tie-break returns positions in *reverse*
+    # original-index order for equal values, which does not match
+    # torch.sort(stable=True)'s contract (equal elements should keep their
+    # original relative order). Not corrected here -- see issue #4500's
+    # follow-up investigation for why (every correction approach tried hit a
+    # separate real compiler/hardware gap). Values are always correct;
+    # index order among tied values is not guaranteed to be stable.
+    signed_input = input if descending else -input
+    values = torch.ops.spyre.topkvalue(signed_input, n, dim)
+    indices = torch.ops.spyre.topkindex(signed_input, n, dim)
+    if not descending:
+        values = -values
+    return values, indices
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.sort.values, torch.ops.aten.sort.values_stable]
+)
+def spyre_sort_out(
+    input: torch.Tensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: Optional[bool] = None,
+    values: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """out= variant of spyre_sort: aten::sort.values / sort.values_stable.
+
+    Reached by ``torch.sort(..., out=(values, indices))`` and by direct calls
+    to ``torch.ops.aten.sort.values_stable``, both of which bypass the
+    ``default``/``stable`` overloads spyre_sort covers.
+    """
+    computed_values, computed_indices = spyre_sort(
+        input, dim, descending, stable=stable
+    )
+    values.copy_(computed_values)
+    indices.copy_(computed_indices)
+    return values, indices
+
+
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
