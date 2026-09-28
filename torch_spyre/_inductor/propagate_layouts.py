@@ -1727,7 +1727,10 @@ def _multi_arg_pointwise_layouts(
                 # Check if stick coordinate depends on any index symbol
                 for index_sym in ind_sizes:
                     if index_sym in stick_coord.free_symbols:
-                        return False
+                        # One non-unit dim leaves nowhere else to put the
+                        # index, so let it through and re-tile it later.
+                        if sum(1 for size in c_in_size if size != 1) > 1:
+                            return False
         return True
 
     results: list[SpyreTensorLayout] = []
@@ -1886,6 +1889,10 @@ def _topk_layouts(
         if reduction_var in x_stick_expr.free_symbols:
             for c in surviving_coords:
                 out_stick_dims.add(matching_dim(out_coords, c))
+            if not surviving_coords:
+                # Every other dim has host size 1 (e.g. (1, N) with dim=1),
+                # so the output falls back to a synthetic stick.
+                out_stick_dims.add(None)
         else:
             out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
 
