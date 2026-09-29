@@ -33,6 +33,7 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     host_coordinates,
 )
+from torch_spyre._inductor.propagate_layouts import _candidate_output_stls
 
 
 def _contiguous(size: list[int]) -> tuple[FixedLayout, MemoryDep]:
@@ -131,6 +132,40 @@ class TestSymbolicTarget(unittest.TestCase):
         expected = SpyreTensorLayout([128, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(list(target.device_size), list(expected.device_size))
         self.assertEqual(list(target.stride_map), list(expected.stride_map))
+
+    def test_constant_offset_is_not_a_size1_target(self):
+        """Only a target stick of 0 means a size-1 dim; other constants are offsets."""
+        host, dep = _contiguous([1, 256])
+        stl = SpyreTensorLayout([1, 256], [256, 1], torch.float16, [0, 1])
+        ic = host_coordinates(host, dep, None)
+        idc = device_coordinates(stl, dep, None)
+
+        self.assertIsNotNone(
+            compute_restickify_target_layout(stl, host, sympy.S.Zero, ic, idc)
+        )
+        self.assertIsNone(
+            compute_restickify_target_layout(stl, host, sympy.Integer(5), ic, idc)
+        )
+
+
+class TestCandidateOrder(unittest.TestCase):
+    """Output stick candidates try a size-1 dim only after every other dim."""
+
+    def _candidate_stick_strides(self, size: list[int], skip_dim: int) -> list[int]:
+        """Host stride of each candidate's stick; -1 means a size-1 dim."""
+        host, dep = _contiguous(size)
+        coords = host_coordinates(host, dep, None)
+        stls = _candidate_output_stls(
+            coords, dep, size, list(host.stride), coords[skip_dim], torch.float16
+        )
+        return [stl.stride_map[-1] for stl in stls]
+
+    def test_unaligned_dim_beats_size1_dim(self):
+        stick_strides = self._candidate_stick_strides([1, 100, 30], skip_dim=1)
+        self.assertEqual(stick_strides, [1])
+
+    def test_size1_dim_when_nothing_else(self):
+        self.assertEqual(self._candidate_stick_strides([1, 100], skip_dim=1), [-1])
 
 
 if __name__ == "__main__":

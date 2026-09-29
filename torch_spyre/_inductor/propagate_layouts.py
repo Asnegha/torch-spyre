@@ -292,8 +292,6 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(dtype)
-    if stick_dim >= 0 and c_size[stick_dim] == 1:
-        return None
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
@@ -319,10 +317,14 @@ def _candidate_output_stls(
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
+    # Size-1 dims come last: one element per stick takes stick_size times the
+    # memory, so they are used only when no other dim yields a candidate.
     all_dims = [d for d in range(len(c_size)) if d != skip_dim]
     aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
+    size1_dims = [d for d in unaligned_dims if c_size[d] == 1]
+    unaligned_dims = [d for d in unaligned_dims if c_size[d] != 1]
     stls: list[SpyreTensorLayout] = []
-    for dims in (aligned_dims, unaligned_dims):
+    for dims in (aligned_dims, unaligned_dims, size1_dims):
         for d in dims:
             stl = _make_output_stl(out_coords, output_dep, c_size, c_stride, d, dtype)
             if stl is not None:
@@ -2435,8 +2437,9 @@ def _find_alt_target_stl(
     An offset write, or an offset-free sub-stick write (see
     ``_is_substick_write``), needs its stick dim relocated. The first candidate
     reachable from the write's input stick wins, meaning one an ordinary
-    stick-permutation restickify can produce, so a degenerate ``stick=0``
-    candidate cannot win a pairing the cost model would reject as a scatter.
+    stick-permutation restickify can produce. Candidates on a size-1 dim are
+    only generated when no other dim yields one (see _candidate_output_stls),
+    so a degenerate ``stick=0`` candidate cannot displace a real dim.
     Falls back to the first offset-free candidate.
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)

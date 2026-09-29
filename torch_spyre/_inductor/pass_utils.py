@@ -2204,15 +2204,16 @@ def compute_restickify_target_layout(
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
 
-    A constant target_stick_expr (no free symbols) moves the stick onto a
-    dim of size 1, so each stick holds one element. The size-1 dim need not
-    exist on the host: it behaves the same whether it is real or synthetic.
+    A target_stick_expr of 0 moves the stick onto a dim of size 1, so each
+    stick holds one element. The size-1 dim need not exist on the host: it
+    behaves the same whether it is real or synthetic. Any other constant is
+    a stick offset, which cannot be targeted.
 
     Returns None if the restickify is infeasible.
     """
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    size1_target = not target_stick_expr.free_symbols
+    size1_target = target_stick_expr == sympy.S.Zero
     if size1_target:
         # A size-1 dim has one element and maps to no host stride, as in
         # dim_map_to_stride_map in spyre_tensor_impl.cpp.

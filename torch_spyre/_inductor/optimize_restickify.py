@@ -32,7 +32,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 from .pass_utils import (
     compute_restickify_needed,
     compute_size1_restickify_target,
@@ -117,11 +117,14 @@ class EdgeCostMap:
                 # var): this pairing is invalid even though stick_compatible
                 # accepted it. The target's stick carries no input var, so
                 # move the input's stick onto a size-1 dim; if there is none,
+                # or ReStickifyOpHBM cannot lower the input's format (it
+                # supports only SEN169_FP16, see compute_restickify_needed),
                 # mark as infeasible so the optimizer picks another pairing.
                 needed = True
-                tgt = compute_size1_restickify_target(
-                    in_stl, self._dep_layout, self.dep, self._op
-                )
+                if in_stl.device_dtype == DataFormats.SEN169_FP16:
+                    tgt = compute_size1_restickify_target(
+                        in_stl, self._dep_layout, self.dep, self._op
+                    )
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
