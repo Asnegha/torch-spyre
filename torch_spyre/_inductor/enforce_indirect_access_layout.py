@@ -304,6 +304,25 @@ def _is_permutation_of(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
     )
 
 
+def _relayout_target_for_indirect_stride(
+    stl: SpyreTensorLayout,
+    stride_idx: int,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Required STL putting the indexed coordinate where indirect access can
+    reach it: re-tiled if it's the stick (stride_idx == 0), else rotated to
+    device position 0.
+    """
+    if stride_idx == 0:
+        return _retile_entry_per_stick(stl, host_layout, dep, op, access_subs, sizes)
+    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
+    return _build_required_stl(stl, indirect_device_pos)
+
+
 def _can_mutate_producer_in_place(value_buf, output_names: set[str]) -> bool:
     """Check if a value buffer's producer layout can be rewritten in place.
 
@@ -655,18 +674,15 @@ def _insert_mutation_relayout_copy(
             f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
         )
     assert write_stride_idx is not None
-    if write_stride_idx == 0:
-        required_stl = _retile_entry_per_stick(
-            output_stl,
-            _output_real_layout(mutation_op),
-            write_dep,
-            mutation_op,
-            write_subs,
-            write_sizes,
-        )
-    else:
-        output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-        required_stl = _build_required_stl(output_stl, output_indirect_pos)
+    required_stl = _relayout_target_for_indirect_stride(
+        output_stl,
+        write_stride_idx,
+        _output_real_layout(mutation_op),
+        write_dep,
+        mutation_op,
+        write_subs,
+        write_sizes,
+    )
 
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
@@ -1033,13 +1049,9 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
                 continue
 
             # Put the indexed coordinate where the gather can address it
-            if stride_idx == 0:
-                required_stl = _retile_entry_per_stick(
-                    value_stl, value_layout, value_dep, op, access_subs, sizes
-                )
-            else:
-                indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-                required_stl = _build_required_stl(value_stl, indirect_device_pos)
+            required_stl = _relayout_target_for_indirect_stride(
+                value_stl, stride_idx, value_layout, value_dep, op, access_subs, sizes
+            )
 
             if _is_permutation_of(
                 value_stl, required_stl
