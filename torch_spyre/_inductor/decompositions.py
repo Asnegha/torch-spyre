@@ -1830,6 +1830,49 @@ def spyre_topk(
     )
 
 
+@register_spyre_decompositions(
+    [torch.ops.aten.sort.default, torch.ops.aten.sort.stable]
+)
+def spyre_sort(
+    input: torch.Tensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sort`` as a full-length topk (k = size of ``dim``); always stable.
+
+    topk only returns the largest elements, so an ascending sort runs it on
+    ``-input`` and negates the values back. Among equal keys topk emits the
+    highest index first, so the input is flipped along ``dim`` beforehand:
+    the highest flipped index is then the lowest original one, which is the
+    stable order. ``(n - 1) - i`` maps a flipped index back.
+    """
+    if input.numel() == 0:
+        # Nothing to reorder, and topk rejects zero-size tensors.
+        return input.clone(), torch.empty_like(input, dtype=torch.int64)
+    if input.dim() == 0:
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    dim = dim % input.dim()
+    n = input.size(dim)
+    if n == 1:
+        # A single-element sort is the identity; skip the reduction entirely.
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    if not input.dtype.is_floating_point:
+        # topkvalue/topkindex (and neg) only bind fp16/fp32 in DeepTools.
+        raise Unsupported(f"sort on a non-floating-point input: {input.dtype}")
+    key = torch.flip(input, [dim])
+    if not descending:
+        key = -key
+    values = torch.ops.spyre.topkvalue(key, n, dim)
+    if not descending:
+        values = -values
+    # topkindex yields the index in the input dtype; every index is exact there
+    # because topk caps n far below fp16's 2048 integer limit.
+    indices = (n - 1) - torch.ops.spyre.topkindex(key, n, dim)
+    return values, indices.to(torch.int64)
+
+
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,

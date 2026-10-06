@@ -1490,6 +1490,73 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Inputs repeat a few small integers so every row has ties (exercising
+        # stability) and fp16 holds every value exactly.
+        ("test_sort", "test_sort_cpu"): {
+            "param_sets": {
+                "2d_dim0_asc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    0,
+                    False,
+                ),
+                "2d_dim0_desc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    0,
+                    True,
+                ),
+                "2d_ties_dim0_asc": (
+                    (torch.arange(64 * 8) % 5).reshape(64, 8).to(torch.float16),
+                    0,
+                    False,
+                ),
+                "2d_ties_dim0_desc": (
+                    (torch.arange(128 * 64) % 7).reshape(128, 64).to(torch.float16),
+                    0,
+                    True,
+                ),
+                "2d_dim0_fp32": (
+                    unique_randn_along_dim((32, 64), dim=0, dtype=torch.float32),
+                    0,
+                    False,
+                ),
+                "3d_ties_dim1": (
+                    (torch.arange(2 * 16 * 64) % 3).reshape(2, 16, 64).half(),
+                    1,
+                    False,
+                ),
+                "4d_ties_dim2_desc": (
+                    (torch.arange(2 * 4 * 8 * 64) % 3).reshape(2, 4, 8, 64).half(),
+                    2,
+                    True,
+                ),
+                "2d_size1_dim0": (
+                    unique_randn_along_dim((1, 64), dim=1),
+                    0,
+                    False,
+                ),
+            },
+        },
+        # Sorting along the stick dim needs topk to move its reduction dim off
+        # the stick onto a size-1 dim (#4975).
+        ("test_sort_stick_dim", "test_sort_stick_dim_cpu"): {
+            "param_sets": {
+                "2d_dim1_asc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    1,
+                    False,
+                ),
+                "2d_ties_dim1_desc": (
+                    (torch.arange(8 * 64) % 5).reshape(8, 64).to(torch.float16),
+                    1,
+                    True,
+                ),
+                "1d_ties": (
+                    (torch.arange(64) % 4).to(torch.float16),
+                    0,
+                    False,
+                ),
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -7693,6 +7760,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(torch.softmax(x, dim=-1), 4, dim=-1)[0],
             x,
             run_eager=False,
+        )
+
+    def test_sort_cpu(self, x, dim: int, descending: bool):
+        # Indices are compared too: the decomposition is always stable, so
+        # they must match CPU's stable sort exactly, ties included.
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
+        )
+
+    def test_sort_int64_rejected(self):
+        # topkvalue/topkindex only bind fp16/fp32, so compile must raise.
+        x = (torch.arange(64 * 8) % 5).reshape(64, 8)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.sort(x, dim=0, stable=True),
+                [x],
+                "spyre",
+            )
+
+    @unittest.skip("topk along the stick dim needs #4975")
+    def test_sort_stick_dim_cpu(self, x, dim: int, descending: bool):
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
         )
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
