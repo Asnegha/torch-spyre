@@ -1840,13 +1840,14 @@ def spyre_sort(
     *,
     stable: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``sort`` as a full-length topk (k = size of ``dim``); always stable.
+    """``sort`` as a full-length topk (k = size of ``dim``).
 
     topk only returns the largest elements, so an ascending sort runs it on
     ``-input`` and negates the values back. Among equal keys topk emits the
-    highest index first, so the input is flipped along ``dim`` beforehand:
-    the highest flipped index is then the lowest original one, which is the
-    stable order. ``(n - 1) - i`` maps a flipped index back.
+    highest index first. That order is allowed unless ``stable=True``; then
+    the input is flipped along ``dim`` beforehand, so the highest flipped
+    index is the lowest original one (the stable order), and ``(n - 1) - i``
+    maps a flipped index back.
     """
     if input.numel() == 0:
         # Nothing to reorder, and topk rejects zero-size tensors.
@@ -1861,7 +1862,10 @@ def spyre_sort(
     if not input.dtype.is_floating_point:
         # topkvalue/topkindex (and neg) only bind fp16/fp32 in DeepTools.
         raise Unsupported(f"sort on a non-floating-point input: {input.dtype}")
-    key = torch.flip(input, [dim])
+    if stable and any(isinstance(size, torch.SymInt) for size in input.shape):
+        # spyre_flip's gather cannot take symbolic sizes yet.
+        raise Unsupported("sort(stable=True) with dynamic shapes")
+    key = torch.flip(input, [dim]) if stable else input
     if not descending:
         key = -key
     values = torch.ops.spyre.topkvalue(key, n, dim)
@@ -1869,7 +1873,9 @@ def spyre_sort(
         values = -values
     # topkindex yields the index in the input dtype; every index is exact there
     # because topk caps n far below fp16's 2048 integer limit.
-    indices = (n - 1) - torch.ops.spyre.topkindex(key, n, dim)
+    indices = torch.ops.spyre.topkindex(key, n, dim)
+    if stable:
+        indices = (n - 1) - indices
     return values, indices.to(torch.int64)
 
 

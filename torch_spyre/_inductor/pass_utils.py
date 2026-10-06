@@ -44,6 +44,7 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.symbol import SymT, symbol_is_type
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -862,11 +863,17 @@ def _build_indirect_store_subs(
     write_dep = writes[0]
 
     # Extract scatter index symbols (symbols in write_dep.index not in loop
-    # ranges and not a WhileLoop-splice per-iteration loop_var).
+    # ranges, not a WhileLoop-splice per-iteration loop_var, and not a
+    # dynamic-shape size symbol). With dynamic=True a write's strides carry
+    # size symbols such as ``s0``; they are not loop vars either, so without
+    # this exclusion any op with a symbolic stride (e.g. topk) is taken for a
+    # scatter and its dims are pinned unsplit by indirect_access_split_domains.
     all_write_syms = write_dep.index.free_symbols
     loop_syms = set(write_dep.ranges.keys())
     loop_syms |= set(loop_var_ranges_from_dim_hints(op))
-    scatter_index_syms = all_write_syms - loop_syms
+    scatter_index_syms = {
+        s for s in all_write_syms - loop_syms if not symbol_is_type(s, SymT.SIZE)
+    }
 
     if not scatter_index_syms:
         # No scatter symbols found.
