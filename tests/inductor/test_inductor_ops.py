@@ -1623,8 +1623,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Sorting along the stick dim needs topk to move its reduction dim off
-        # the stick onto a size-1 dim (#4975).
+        # Stable sort along the stick dim fails on main: Inductor fuses flip's
+        # gather, neg and topk into one kernel that DeepTools rejects ("There
+        # must be at least one valid candidate"). It passes with #4975.
         ("test_sort_stick_dim", "test_sort_stick_dim_cpu"): {
             "param_sets": {
                 "2d_dim1_asc": (
@@ -7909,7 +7910,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    @unittest.skip("topk along the stick dim needs #4975")
+    @unittest.skip("fused flip->topk kernel along the stick dim needs #4975")
     def test_sort_stick_dim_cpu(self, x, dim: int, descending: bool):
         self.compare_with_cpu(
             lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
