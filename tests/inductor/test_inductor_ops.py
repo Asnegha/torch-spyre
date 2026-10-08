@@ -1605,6 +1605,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                     False,
                 ),
+                # Last (stick) dim, widths that are not a whole number of
+                # sticks: the stable flip pads to a full stick.
+                "2d_ties_last_dim_w60": (
+                    (torch.arange(16 * 60) * 7 % 5).reshape(16, 60).half(),
+                    1,
+                    False,
+                ),
+                "2d_ties_last_dim_w7_desc": (
+                    (torch.arange(16 * 7) * 7 % 5).reshape(16, 7).half(),
+                    1,
+                    True,
+                ),
+                "2d_ties_last_dim_w100": (
+                    (torch.arange(16 * 100) * 7 % 5).reshape(16, 100).half(),
+                    1,
+                    False,
+                ),
+                # Sort-dim sizes topk can't split across cores: padded to the
+                # next size that can (67 -> 68, 127 -> 128, 35 -> 36).
+                "2d_ties_unsplittable_n67_dim0": (
+                    (torch.arange(67 * 16) * 7 % 5).reshape(67, 16).half(),
+                    0,
+                    False,
+                ),
+                "2d_ties_unsplittable_n127_last_dim_desc": (
+                    (torch.arange(16 * 127) * 7 % 5).reshape(16, 127).half(),
+                    1,
+                    True,
+                ),
+                "2d_ties_unsplittable_n35_dim0_desc": (
+                    (torch.arange(35 * 16) * 7 % 5).reshape(35, 16).half(),
+                    0,
+                    True,
+                ),
             },
         },
         ("test_sort_unstable", "test_sort_unstable_cpu"): {
@@ -1911,6 +1945,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_0_2": ([0, 2], cached_randn((2, 3, 5, 256))),
                 "2d_size1_dim_0": ([0], cached_randn((1, 256))),
                 "2d_no_dims": ([], cached_randn((67, 256))),
+                # Stick-dim widths that are not a whole number of sticks are
+                # left-padded to a full stick, flipped, and narrowed back.
+                "2d_dim_1_unaligned": ([1], cached_randn((16, 60))),
+                "2d_dim_neg1_unaligned_narrow": ([-1], cached_randn((16, 7))),
+                "2d_dim_1_unaligned_two_sticks": ([1], cached_randn((16, 100))),
+                "3d_dim_2_unaligned": ([2], cached_randn((2, 8, 60))),
                 # Stick-dim reversals are unsupported and, rather than raising,
                 # fault the card, so they cannot run as xfails.
                 "2d_dim_1_stick": ([1], cached_randn((67, 256))),
@@ -7900,6 +7940,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 torch.testing.assert_close(values.cpu(), expected_values)
                 torch.testing.assert_close(indices.cpu(), expected_indices)
 
+    def test_sort_unsplittable_with_inf(self):
+        # The pad for an unsplittable sort dim is -inf in topk's key space and
+        # sits at the front, so it loses every tie with a real +-inf element.
+        for dim in (0, 1):
+            with self.subTest(dim=dim):
+                shape = (67, 16) if dim == 0 else (16, 67)
+                x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).half()
+                x.narrow(dim, 0, 2).fill_(float("inf"))
+                x.narrow(dim, 5, 2).fill_(float("-inf"))
+                self.compare_with_cpu(
+                    lambda x, dim=dim: torch.sort(x, dim=dim, stable=True), x
+                )
+
     def test_sort_int64_rejected(self):
         # topkvalue/topkindex only bind fp16/fp32, so compile must raise.
         x = (torch.arange(64 * 8) % 5).reshape(64, 8)
@@ -8355,6 +8408,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # descending index (see spyre_flip); the arange building that index
         # falls back to CPU, hence the filtered FallbackWarning.
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
+
+    def test_flip_unaligned_multi_dim_rejected(self):
+        # A padded (unaligned) stick-dim flip combined with another dim's
+        # gather faults the card, so it must raise before any kernel runs.
+        x = cached_randn((16, 60))
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(lambda x: torch.flip(x, [0, 1]), [x], "spyre")
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
