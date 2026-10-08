@@ -1046,7 +1046,8 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            # With dynamic=True the gathered dim's size is a symbol (e.g. s21).
+            self._pending_indirect_index_size = concretize_expr(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
@@ -1096,7 +1097,13 @@ def _build_indirect_load_subs(
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
         size = indirect_index_size_map.get(d.name)
-        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
+        # Size symbols (dynamic=True strides such as s21) are not loop vars
+        # either, but they are not gather indices.
+        indirect_syms = [
+            s
+            for s in d.index.free_symbols
+            if s not in d.ranges and not symbol_is_type(s, SymT.SIZE)
+        ]
         if len(indirect_syms) > 1:
             raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
         for sym in indirect_syms:

@@ -7815,15 +7815,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 torch.testing.assert_close(values.cpu(), expected_values)
                 torch.testing.assert_close(indices.cpu(), expected_indices)
 
-    def test_sort_stable_dynamic_rejected(self):
-        # The stable path flips the input, and spyre_flip's gather cannot take
-        # symbolic sizes yet, so compile must raise instead of crashing in flip.
-        x = unique_randn_along_dim((8, 64), dim=0)
-        torch._dynamo.reset()
-        with pytest.raises(Exception, match="Unsupported"):
-            torch.compile(lambda x: torch.sort(x, dim=0, stable=True), dynamic=True)(
-                x.to("spyre")
-            )
+    def test_sort_stable_dynamic(self):
+        # The stable path flips the input (a gather) and maps indices back with
+        # amax, since a symbolic n can't be a pointwise constant. Inputs repeat
+        # small integers so ties check the stable order. dim and descending are
+        # literals: dynamic=True would turn closure ints into SymInts.
+        cases = [
+            ((16, 64), lambda x: torch.sort(x, dim=0, stable=True)),
+            ((16, 64), lambda x: torch.sort(x, dim=0, descending=True, stable=True)),
+            ((2, 16, 64), lambda x: torch.sort(x, dim=1, stable=True)),
+        ]
+        for shape, fn in cases:
+            with self.subTest(shape=shape):
+                x = (torch.arange(math.prod(shape)) * 7 % 5).reshape(shape).half()
+                torch._dynamo.reset()
+                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
+                expected_values, expected_indices = fn(x)
+                torch.testing.assert_close(values.cpu(), expected_values)
+                torch.testing.assert_close(indices.cpu(), expected_indices)
 
     def test_sort_int64_rejected(self):
         # topkvalue/topkindex only bind fp16/fp32, so compile must raise.

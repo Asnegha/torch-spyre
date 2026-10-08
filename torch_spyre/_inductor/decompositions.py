@@ -1847,7 +1847,9 @@ def spyre_sort(
     highest index first. That order is allowed unless ``stable=True``; then
     the input is flipped along ``dim`` beforehand, so the highest flipped
     index is the lowest original one (the stable order), and ``(n - 1) - i``
-    maps a flipped index back.
+    maps a flipped index back. With dynamic shapes ``n`` is symbolic, which a
+    Spyre pointwise op cannot take as a constant; the flipped indices are a
+    permutation of ``0 .. n-1``, so their ``amax`` along ``dim`` is ``n - 1``.
     """
     if input.numel() == 0:
         # Nothing to reorder, and topk rejects zero-size tensors.
@@ -1862,9 +1864,6 @@ def spyre_sort(
     if not input.dtype.is_floating_point:
         # topkvalue/topkindex (and neg) only bind fp16/fp32 in DeepTools.
         raise Unsupported(f"sort on a non-floating-point input: {input.dtype}")
-    if stable and any(isinstance(size, torch.SymInt) for size in input.shape):
-        # spyre_flip's gather cannot take symbolic sizes yet.
-        raise Unsupported("sort(stable=True) with dynamic shapes")
     key = torch.flip(input, [dim]) if stable else input
     if not descending:
         key = -key
@@ -1874,7 +1873,9 @@ def spyre_sort(
     # topkindex yields the index in the input dtype; every index is exact there
     # because topk caps n far below fp16's 2048 integer limit.
     indices = torch.ops.spyre.topkindex(key, n, dim)
-    if stable:
+    if stable and isinstance(n, torch.SymInt):
+        indices = torch.amax(indices, dim, keepdim=True) - indices
+    elif stable:
         indices = (n - 1) - indices
     return values, indices.to(torch.int64)
 
