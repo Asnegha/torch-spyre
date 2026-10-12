@@ -12,23 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import math
 import os
 import platform
 import sys
+import warnings
 import pytest
 import unittest
 import torch
 import torch.nn.functional as F
 
 
+from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
     cached_randn,
     cached_xavier,
     compare_with_cpu,
+    expects_raise,
     make_param_dict,
     unique_randn_along_dim,
     shapes2key,
@@ -443,6 +447,24 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
 ]
 
+# Conversions the device layout cannot be rescaled for. An fp32 stick holds 32
+# elements and an fp16/bf16 stick 64, so a dim of one or three fp32 sticks (the
+# 4x32, 4x68 and 68 shapes) is not a whole number of output sticks. The staggered
+# element arrangement cannot use a partially filled stick, so
+# rescale_stl_for_dtype rejects the conversion with Unsupported instead of
+# dropping data (flooring) or returning wrong values (rounding up) (#3809, #3604).
+# This is a rejection by design, so these cases assert it.
+_RESCALE_REJECTION = "cannot rescale device layout"
+_RESCALE_REJECTED_SHAPES = ("4x32", "4x68", "68")
+TO_DTYPE_OP_RESCALE_REJECTED = {
+    f"float32_to_{dst}_{shape}"
+    for dst in ("float16", "bfloat16")
+    for shape in _RESCALE_REJECTED_SHAPES
+}
+TO_DTYPE_OP_EXPECT_FAIL = [
+    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
+]
+
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
@@ -467,10 +489,29 @@ TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
 # pairs (see test_upcast_consumed_on_partial_stick). The implicit round
 # trip still hits an unsupported op on these shapes.
 _ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
+# The explicit add and copy round trips are rejected for the rescale reason above
+# on fp32 -> fp16 at all three shapes, and on the 4x32 upcast to fp32. The implicit
+# round trip is rejected on every pair at all three shapes.
+ROUND_TRIP_RESCALE_REJECTED = {
+    *(f"float32_to_float16_{shape}" for shape in _RESCALE_REJECTED_SHAPES),
+    "float16_to_float32_4x32",
+    "bfloat16_to_float32_4x32",
+}
+ROUND_TRIP_IMPLICIT_RESCALE_REJECTED = {
+    f"{src}_to_{dst}_{shape}"
+    for src, dst in (
+        ("bfloat16", "float16"),
+        ("bfloat16", "float32"),
+        ("float16", "float32"),
+        ("float32", "float16"),
+    )
+    for shape in _RESCALE_REJECTED_SHAPES
+}
 _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
     case
     for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
     if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
+    and case not in ROUND_TRIP_RESCALE_REJECTED
 ]
 
 # Further round-trip cases that now pass on every config. They differ between the
@@ -505,10 +546,20 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
+# These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
+# the xfail-marked tests, each has passed in some of them). The bfloat16 case is the
+# sibling of the float16 one. Cause not investigated (see #5285), so they are
+# non-strict xfails.
+_ROUND_TRIP_IMPLICIT_UNSTABLE = {
+    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+    "bfloat16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+}
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
     for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
     if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
+    and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
+    and case not in ROUND_TRIP_IMPLICIT_RESCALE_REJECTED
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -1102,10 +1153,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             # exp miscompiles on an unaligned trailing extent (issue #3799);
             # the same extent passes through a mul chain in test_pow_int.
-            "expect_fail": [
-                "0.3_fp16_2d_unaligned",
-                "2.5_fp16_2d_unaligned",
-            ],
+            # These fail because the work-division planner splits the unaligned
+            # dimension across cores, which the backend cannot mask, but the
+            # generated program differs on some runs and then compiles and can
+            # pass (#5285). A strict xfail would turn that into a flaky failure,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "0.3_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+                "2.5_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+            },
         },
         ("test_add_scalar", "test_unary_op_cpu"): {
             "ops_dict": {
@@ -1118,6 +1174,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((256,),),
                     ((67, 256),),
                     ((67, 71, 256),),
+                ]
+            ),
+        },
+        # A unary op on a view with reordered non-stick dims miscompiled in
+        # deeptools (issue #4869).
+        ("test_pointwise_unary_permuted_view", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "abs": lambda x: torch.abs(x.permute(1, 0, 2, 3)),
+                "neg": lambda x: torch.neg(x.permute(1, 0, 2, 3)),
+                "abs_add": lambda x: torch.abs(x.permute(1, 0, 2, 3)) + 1,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((4, 4, 64, 64),),
+                    ((8, 8, 64, 512),),
                 ]
             ),
         },
@@ -1927,7 +1998,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((1, 1),),
                 ]
             ),
-            "expect_fail": ["49159x4096"],
+            # Same per-core span limit as the large transposes above.
+            "expect_raise": {"49159x4096": "per-core tensor span"},
         },
         # Reversal along a non-stick dim works; the stick (last) dim needs a
         # gather along the stick dimension, which the backend cannot do, and
@@ -2070,12 +2142,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((769, 4096, 64), abs=True),
                 ),
             },
-            "expect_fail": [
-                "large_dim_0_1",
-                "large_dim_0_1_nopad",
-                "large_dim_1_2",
-                "large_dim_1_2_nopad",
-            ],
+            # The per-core span of the 384.5 MB result exceeds the 256 MB hardware
+            # limit; the lowering rejects it (raise_if_per_core_overflow).
+            "expect_raise": {
+                "large_dim_0_1": "per-core tensor span",
+                "large_dim_0_1_nopad": "per-core tensor span",
+                "large_dim_1_2": "per-core tensor span",
+                "large_dim_1_2_nopad": "per-core tensor span",
+            },
         },
         ("test_transpose_3d", "test_transpose_3d_cpu"): {
             "param_sets": {
@@ -2661,12 +2735,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": [
-                "fp16_fp32_1d256",
-                "fp32_fp16_1d256",
-                "fp16_fp32_2d4x64",
-                "fp32_fp16_2d4x64",
-            ],
+            # A STANDARD operand mixed with a staggered one is rejected at compile
+            # time unless the STANDARD operand broadcasts at the stick dim (see
+            # test_round_trip_to_dtype_implicit_invalid, which asserts the same).
+            "expect_raise": {
+                "fp16_fp32_1d256": "Multi-arg pointwise with mixed EA",
+                "fp32_fp16_1d256": "Multi-arg pointwise with mixed EA",
+                "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
+                "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
+            },
             "skip": [
                 "fp16_fp32_bcast_stick",
                 "fp16_fp32_bcast_0dim",
@@ -2916,6 +2993,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0.9,
                     FP16_EPS,
                 ),
+            },
+        },
+        (
+            "test_pointwise_clamp_preserves_unspecified_bound",
+            "test_clamp_preserves_unspecified_bound",
+        ): {
+            "param_sets": {
+                f"{operation}_{dtype_name}": (operation, dtype)
+                for operation in (
+                    "clamp_min",
+                    "clamp_max",
+                    "lower_only",
+                    "upper_only",
+                    "both",
+                )
+                for dtype_name, dtype in (
+                    ("fp16", torch.float16),
+                    ("bf16", torch.bfloat16),
+                    ("fp32", torch.float32),
+                )
             },
         },
         (
@@ -3909,7 +4006,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros((256,), dtype=torch.float16),
                 ),
             },
-            "expect_fail": ["eval_mode"],
+            # TODO: a missing feature, not a design limit. When aten::native_batch_norm
+            # is registered this stops raising, and the case has to become a positive one.
+            "expect_raise": {"eval_mode": "Could not run 'aten::native_batch_norm'"},
         },
         # TODO: TorchInductor compilation failure in the Spyre lowering pass —
         # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
@@ -4313,31 +4412,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "mha_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     False,
                 ),
                 "gqa_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     True,
                 ),
             },
-            "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
@@ -4852,9 +4952,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
-            "expect_fail": [
-                "fp32_3d_dim_neg1",
-            ],
+            # #4492: the backend rejects stick masking for 32-bit types, but only
+            # some builds do. These pass on CI's deeptools and fail on some others,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+            },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
                 "fp16_2d_dim_0": (
@@ -5057,10 +5160,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
-            "expect_fail": [
-                "fp32_3d_dim_2",
-                "fp32_3d_dim_neg1",
-            ],
+            # #4492: the backend rejects stick masking for 32-bit types, but only
+            # some builds do. These pass on CI's deeptools and fail on some others,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "fp32_3d_dim_2": "fp32 stick masking, passes on CI, #4492",
+                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5996,11 +6102,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
+            "expect_raise": dict.fromkeys(
+                TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION
+            ),
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
+            "expect_raise": dict.fromkeys(
+                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
+            ),
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -6218,6 +6330,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
+            "expect_raise": dict.fromkeys(
+                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
+            ),
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -6226,6 +6341,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
+            "expect_fail_unstable": _ROUND_TRIP_IMPLICIT_UNSTABLE,
+            "expect_raise": dict.fromkeys(
+                ROUND_TRIP_IMPLICIT_RESCALE_REJECTED, _RESCALE_REJECTION
+            ),
         },
         (
             "test_reduction_with_to_dtype",
@@ -6342,20 +6461,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # bmm-decomposed path (see the test_conv2d param sets, e.g.
             # 1x3x64_ksize3_pad1).  8x64_ksize3_pad1 was a passing test_conv2d
             # case before depthwise gained its own lowering, so it is kept here
-            # as an xfail to record the capability change rather than letting it
-            # vanish from the suite.  It is strict (see ParameterizedTestMeta and
-            # the XPASS rewrite in tests/conftest.py), so if padding support
-            # lands this flips to a CI failure instead of the gap staying
-            # invisible.
-            #
-            # Caveat, measured: xfail asserts only *that* the case fails, not
-            # that padding is the reason.  Removing just the lowering guard does
-            # not make it XPASS -- the compile then reaches the backend and
-            # aborts (SIGABRT), which is the runtime support the
-            # guard's own message refers to.  So this entry tracks "depthwise +
-            # padding does not work end to end"; a message-asserting negative
-            # test would additionally pin *where* it is rejected.
-            "expect_fail": ["8x64_ksize3_pad1"],
+            # to record the capability change rather than letting it vanish from
+            # the suite.  It asserts the rejection and its reason, so if padding
+            # support lands this fails and has to be turned back into a positive
+            # case.  (As an xfail it would also have passed for the SIGABRT you get
+            # by removing just the guard.)
+            "expect_raise": {
+                "8x64_ksize3_pad1": "Depthwise conv2d currently only supports zero padding"
+            },
             "param_sets": {
                 "1x64_ksize3": (
                     cached_randn((1, 64, 32, 32)),
@@ -7385,6 +7498,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "storage (see #3770)"
                 )
 
+    @expects_raise
     def test_storage_offset_placeholder_fixed_layout_rejected(self):
         # Fixed-layout ops need their inputs' sticks where the op dictates, so
         # an offset stick would need a restickify before the op and another to
@@ -7765,6 +7879,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         }
         return x, ops, shared_cases, api_only_cases
 
+    @expects_raise
     def test_core_reduction_invalid_dims_api(self):
         x, ops, shared_cases, api_only_cases = (
             self._get_core_reduction_invalid_dim_cases()
@@ -7780,6 +7895,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         f"{exc_info.type.__name__}: {exc_info.value!r}"
                     )
 
+    @expects_raise
     def test_core_reduction_invalid_dims_spyre(self):
         x, ops, shared_cases, _ = self._get_core_reduction_invalid_dim_cases()
 
@@ -7797,6 +7913,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         f"{exc_info.type.__name__}: {exc_info.value!r}"
                     )
 
+    @expects_raise
     def test_single_dim_reduction_invalid_dims_api(self):
         x, ops, shared_cases, api_only_cases = (
             self._get_single_dim_reduction_invalid_dim_cases()
@@ -7812,6 +7929,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         f"{exc_info.type.__name__}: {exc_info.value!r}"
                     )
 
+    @expects_raise
     def test_single_dim_reduction_invalid_dims_spyre(self):
         x, ops, shared_cases, _ = self._get_single_dim_reduction_invalid_dim_cases()
 
@@ -7837,6 +7955,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
 
+    @expects_raise
     def test_topk_largest_false_rejected(self):
         # largest=False cannot be served by the topkvalue/topkindex reduction
         # (it always returns the largest elements), so compile must raise.
@@ -7848,6 +7967,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
+    @expects_raise
     def test_topk_unsplittable_k_rejected(self):
         # k=35's divisors are 1, 5, 7, 35: none give k // d <= 4 with
         # d <= SENCORES (32), so no valid multi-core split exists.
@@ -8081,32 +8201,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.count_nonzero on "
-            "floating inputs yet (stable error signature: Unsupported: "
-            "unexpected argument Constant(value=0.0, dtype=torch.float16) to "
-            "notequal)"
-        ),
-        strict=True,
-    )
-    def test_count_nonzero_float_dim0_known_xfail(self):
+    @expects_raise
+    def test_count_nonzero_float_dim0_rejected(self):
+        # The compiled backend has no int32 sum, which count_nonzero needs.
+        # TODO: a missing feature, not a design limit. When int32 sum is
+        # implemented this stops raising, and the test has to become a positive one.
         x = cached_randn((67, 256))
-        self.compare_with_cpu(
-            lambda x: torch.count_nonzero(x, dim=0),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+            self.compare_with_cpu(
+                lambda x: torch.count_nonzero(x, dim=0),
+                x,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.count_nonzero on "
-            "bool inputs yet (stable error signature: Unsupported: unexpected "
-            "argument PointwiseOp(op='to_dtype', ...) to reduction lowering)"
-        ),
-        strict=True,
-    )
-    def test_count_nonzero_bool_dim0_known_xfail(self):
+    @expects_raise
+    def test_count_nonzero_bool_dim0_rejected(self):
+        # The compiled backend has no int32 sum, which count_nonzero needs.
+        # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
         x = torch.tensor(
             [
                 [True, False, True, False, True, False, True],
@@ -8117,11 +8228,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.bool,
         )
-        self.compare_with_cpu(
-            lambda x: torch.count_nonzero(x, dim=0),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+            self.compare_with_cpu(
+                lambda x: torch.count_nonzero(x, dim=0),
+                x,
+                run_eager=False,
+            )
 
     def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
@@ -8131,15 +8243,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.nanmean (stable error signature: InductorError: IndexError: "
-            "list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_nanmean_all_dims_known_xfail(self):
+    @expects_raise
+    def test_nanmean_all_dims_rejected(self):
+        # nanmean sums the non-NaN values, and the backend has no int32 sum.
+        # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -8148,7 +8255,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
+        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+            self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
     @pytest.mark.xfail(
         reason=(
@@ -8225,55 +8333,47 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.var_mean(x, dim=0, keepdim=False), x, run_eager=False
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.cumprod yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::cumprod.out' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_cumprod_dim0_known_xfail(self):
+    @expects_raise
+    def test_cumprod_dim0_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.cumprod is
+        # implemented this stops raising, and the test has to become a positive one.
         x = cached_randn((67, 256), scale=0.1)
-        self.compare_with_cpu(lambda x: torch.cumprod(x, dim=0), x, run_eager=False)
+        with pytest.raises(
+            NotImplementedError, match=r"Could not run 'aten::cumprod\.out'"
+        ):
+            self.compare_with_cpu(lambda x: torch.cumprod(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.logcumsumexp yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::_logcumsumexp' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_logcumsumexp_dim0_known_xfail(self):
+    @expects_raise
+    def test_logcumsumexp_dim0_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.logcumsumexp is
+        # implemented this stops raising, and the test has to become a positive one.
         x = cached_randn((67, 256), scale=0.1)
-        self.compare_with_cpu(
-            lambda x: torch.logcumsumexp(x, dim=0), x, run_eager=False
-        )
+        with pytest.raises(
+            NotImplementedError, match=r"Could not run 'aten::_logcumsumexp'"
+        ):
+            self.compare_with_cpu(
+                lambda x: torch.logcumsumexp(x, dim=0), x, run_eager=False
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.cummax yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::_cummax_helper' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_cummax_dim0_known_xfail(self):
+    @expects_raise
+    def test_cummax_dim0_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.cummax is
+        # implemented this stops raising, and the test has to become a positive one.
         x = unique_randn_along_dim((67, 256), dim=0)
-        self.compare_with_cpu(lambda x: torch.cummax(x, dim=0), x, run_eager=False)
+        with pytest.raises(
+            NotImplementedError, match=r"Could not run 'aten::_cummax_helper'"
+        ):
+            self.compare_with_cpu(lambda x: torch.cummax(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.cummin yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::_cummin_helper' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_cummin_dim0_known_xfail(self):
+    @expects_raise
+    def test_cummin_dim0_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.cummin is
+        # implemented this stops raising, and the test has to become a positive one.
         x = unique_randn_along_dim((67, 256), dim=0)
-        self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
+        with pytest.raises(
+            NotImplementedError, match=r"Could not run 'aten::_cummin_helper'"
+        ):
+            self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
 
     @pytest.mark.xfail(
         reason=(
@@ -8315,29 +8415,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.median yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::median.dim_values' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_median_dim1_known_xfail(self):
+    @expects_raise
+    def test_median_dim1_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.median is
+        # implemented this stops raising, and the test has to become a positive one.
         x = unique_randn_along_dim((67, 71, 256), dim=1)
-        self.compare_with_cpu(
-            lambda x: torch.median(x, dim=1, keepdim=False), x, run_eager=False
-        )
+        with pytest.raises(
+            NotImplementedError, match=r"Could not run 'aten::median\.dim_values'"
+        ):
+            self.compare_with_cpu(
+                lambda x: torch.median(x, dim=1, keepdim=False), x, run_eager=False
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.nanmedian yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::median.dim_values' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_nanmedian_dim0_known_xfail(self):
+    @expects_raise
+    def test_nanmedian_dim0_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.nanmedian is
+        # implemented this stops raising, and the test has to become a positive one.
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -8346,21 +8439,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        self.compare_with_cpu(
-            lambda x: torch.nanmedian(x, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(
+            NotImplementedError, match=r"Could not run 'aten::nanmedian\.dim_values'"
+        ):
+            self.compare_with_cpu(
+                lambda x: torch.nanmedian(x, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.mode yet "
-            "(stable error signature: NotImplementedError: Could not run "
-            "'aten::mode' with arguments from the 'spyre' backend)"
-        ),
-        strict=True,
-    )
-    def test_mode_dim1_known_xfail(self):
+    @expects_raise
+    def test_mode_dim1_rejected(self):
+        # TODO: a missing feature, not a design limit. When torch.mode is
+        # implemented this stops raising, and the test has to become a positive one.
         x = torch.tensor(
             [
                 [0.0, 0.0, 2.0, 3.0],
@@ -8369,9 +8460,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float16,
         )
-        self.compare_with_cpu(
-            lambda x: torch.mode(x, dim=1, keepdim=False), x, run_eager=False
-        )
+        with pytest.raises(NotImplementedError, match=r"Could not run 'aten::mode'"):
+            self.compare_with_cpu(
+                lambda x: torch.mode(x, dim=1, keepdim=False), x, run_eager=False
+            )
 
     def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
@@ -8447,36 +8539,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "Issue #1800: Memory corruption in indexed views of permuted tensors "
                 "(torch-spyre GitHub)"
             )
-        if variant == "vit_attention_cls_token":
-            pytest.xfail(
-                "Issue #543 (eager): aten::_reshape_alias not implemented in eager mode; "
-                "Issue #1731 (compiled): Spyre SIGABRT in fused_bmm_transpose compilation "
-                "(torch-spyre GitHub)"
-            )
-        if (
-            variant
-            in (
-                "attn_scaled_dot_product",
-                "transformer_encoder_attention",
-                "transformer_decoder_cross_attention",
-            )
-            and execution_mode == "eager"
-        ):
-            pytest.xfail(
-                "Issue #543: aten::_reshape_alias not implemented in eager mode "
-                "(torch-spyre GitHub)"
-            )
 
         fn, call_args = _pattern_resolve(variant, args)
         atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
-        compare_with_cpu(
-            fn,
-            *call_args,
-            atol=atol,
-            rtol=rtol,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        # The ViT attention with a CLS token has an unaligned token dim that the
+        # planner splits across cores; the backend cannot mask that (#5285). The
+        # softmax kernel fails in dbo-opt in both modes.
+        with (
+            pytest.raises(
+                Exception,
+                match="Cannot currently apply coordinate masking for dimensions "
+                "split across cores",
+            )
+            if variant == "vit_attention_cls_token"
+            else contextlib.nullcontext()
+        ):
+            compare_with_cpu(
+                fn,
+                *call_args,
+                atol=atol,
+                rtol=rtol,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
@@ -8486,6 +8571,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_range_op(self, op, input, min, max, err):
         self.compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+
+    def test_clamp_preserves_unspecified_bound(self, operation, dtype):
+        """Missing bounds must preserve the input device format's full range."""
+        scale = 1.0 if dtype == torch.float32 else float(2**18)
+
+        def fn(x):
+            large = x if dtype == torch.float32 else x * scale
+            if operation == "clamp_min":
+                bounded = large.clamp_min(1.0)
+            elif operation == "clamp_max":
+                bounded = large.clamp_max(-1.0)
+            elif operation == "lower_only":
+                bounded = large.clamp(min=1.0)
+            elif operation == "upper_only":
+                bounded = large.clamp(max=-1.0)
+            else:
+                bounded = large.clamp(min=-1.0, max=1.0)
+            return bounded if dtype == torch.float32 else bounded * (1.0 / scale)
+
+        # fp16 reaches DLFloat16's largest finite intermediate (0x7FFE).
+        # bf16 rounds 32704 up, so use its next smaller representable value.
+        largest = {
+            torch.float16: 32704,
+            torch.bfloat16: 32640,
+            torch.float32: torch.finfo(torch.float32).max / scale,
+        }[dtype]
+        values = torch.tensor(
+            [-largest, -24576, -8192, -1, 0, 1, 8192, 24576, largest], dtype=dtype
+        )
+        if dtype == torch.float32:
+            values = torch.cat((values, torch.tensor([-float("inf"), float("inf")])))
+        values = values[:, None].expand(-1, 64).contiguous()
+        # Compute the reference in fp32 so the enlarged intermediate stays finite.
+        expected = fn(values.float()).to(dtype)
+        with fresh_inductor_cache(), torch.inference_mode():
+            actual, source_codes = run_and_get_code(
+                torch.compile(fn, fullgraph=True, dynamic=False), values.to("spyre")
+            )
+        generated = "\n".join(source_codes)
+        self.assertIn("op='clip'", generated)
+        self.assertNotIn("op='minimum'", generated)
+        self.assertNotIn("op='maximum'", generated)
+        actual = actual.cpu()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0.002)
 
     def test_activation_cls(self, op, input, kwargs, err):
         # Spyre activation custom ops (e.g. spyre::gelu) have a pass-through
@@ -8598,18 +8727,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, dst, src, run_eager=False)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
+        """
+        Verify that cumsum executes via the CPU fallback path and emits
+        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        """
+
         def fn(t):
-            t = torch.exp(t)  # compiled op
+            t = torch.exp(t)
             t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
-            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
+            t = torch.exp(t.clamp(-1, 1))
             return t
 
-        with pytest.warns(UserWarning) as record:
-            self.compare_with_cpu(fn, x, cpu_compile=True)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        print(f"Warn {len(record)}")
+        fallback_warnings = [
+            w
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+            and "aten.cumsum" in str(w.message)
+        ]
+        assert len(fallback_warnings) > 0, (
+            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"All captured: {[str(w.message) for w in captured]}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
@@ -8879,13 +9022,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             x = x.clone()
             x.fill_(value)
             return x
-
-        # RuntimeError: Error: In-device copy not implemented.
-        # ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1381
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="spyre__fill_scalar crashes with SIGBUS in eager mode - in-device copy not implemented"
-            )
 
         self.compare_with_cpu(
             fn,
@@ -9379,6 +9515,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             expected[:, :, start:end].copy_(y)
         torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
 
+    @expects_raise
     def test_slice_stick_mutation_no_alt_dim_raises(self):
         """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
 
@@ -9413,6 +9550,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.005,
         )
 
+    @expects_raise
     def test_slice_scatter_step_raises(self):
         """A strided (non-unit-step) slice_scatter raises Unsupported."""
 
@@ -10059,51 +10197,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
-    @pytest.mark.xfail(
-        reason=(
-            "RESTICKIFY_OP does not support FP32 dtype "
-            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.IEEE_FP32)"
-        ),
-        strict=True,
-    )
-    def test_restickify_fp32_unsupported_xfail(self):
-        """Verify RESTICKIFY_OP correctly rejects FP32 dtype.
+    @expects_raise
+    def test_restickify_fp32_unsupported(self):
+        """An op that needs a restickify has no feasible layout for FP32.
 
-        Operations that would trigger restickify (like transpose + pointwise)
-        should fail with Unsupported error when using FP32 tensors.
+        ``x.t() + y`` needs a restickify, which only exists for the DL16 format
+        (fp16 and bf16; both compile and match the CPU). With FP32 operands the
+        layout optimizer finds no feasible layout. That is its generic "no
+        mechanism to resolve stick incompatibility" error, which also fires for
+        other causes (unaligned re-offsets, #1377), so the fragment pins the FP32
+        device dtype that the message lists for each input.
         """
         x = torch.randn((128, 128), dtype=torch.float32)
         y = torch.randn((128, 128), dtype=torch.float32)
         # Transpose creates layout incompatibility that triggers restickify
-        self.compare_with_cpu(
-            lambda x, y: x.t() + y,
-            x,
-            y,
-            run_eager=False,
-        )
+        with pytest.raises(
+            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
+        ):
+            self.compare_with_cpu(
+                lambda x, y: x.t() + y,
+                x,
+                y,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "RESTICKIFY_OP does not support INT64 dtype "
-            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.INT32)"
-        ),
-        strict=True,
-    )
-    def test_restickify_int64_unsupported_xfail(self):
-        """Verify RESTICKIFY_OP correctly rejects INT64 dtype.
+    @expects_raise
+    def test_restickify_int64_unsupported(self):
+        """The same, for INT64: there is no feasible layout without a restickify.
 
-        Operations that would trigger restickify (like transpose + pointwise)
-        should fail with Unsupported error when using INT64 tensors.
+        The device computes the int64 add in IEEE_FP32 (the message lists IEEE_FP32
+        for the converted operands), so the fragment pins that dtype, as above.
         """
         x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         # Transpose creates layout incompatibility that triggers restickify
-        self.compare_with_cpu(
-            lambda x, y: x.t() + y,
-            x,
-            y,
-            run_eager=False,
-        )
+        with pytest.raises(
+            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
+        ):
+            self.compare_with_cpu(
+                lambda x, y: x.t() + y,
+                x,
+                y,
+                run_eager=False,
+            )
 
     def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
         """Test _scaled_mm with FP8 inputs."""
@@ -10363,6 +10499,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @expects_raise
     def test_is_nonzero_error_cases(self):
         """Test that multi-element tensors raise RuntimeError in compiled context."""
         # Multi-element tensor - compiled path
