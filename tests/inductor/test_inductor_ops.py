@@ -8073,6 +8073,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda x, dim=dim: torch.sort(x, dim=dim, stable=True), x
                 )
 
+    @expects_raise
     def test_sort_int64_rejected(self):
         # topkvalue/topkindex only bind fp16/fp32, so compile must raise.
         x = (torch.arange(64 * 8) % 5).reshape(64, 8)
@@ -8501,6 +8502,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # falls back to CPU, hence the filtered FallbackWarning.
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
 
+    @expects_raise
     def test_flip_unaligned_multi_dim_rejected(self):
         # A padded (unaligned) stick-dim flip combined with another dim's
         # gather faults the card, so it must raise before any kernel runs.
