@@ -8261,20 +8261,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=InductorError,
-        reason=(
-            "topk.ddl (dxp_standalone) does not support sparse input tensors; "
-            "the backend compiler fails (#4732)"
-        ),
-    )
     def test_topk_sparse_input(self):
         # amax over the stick dim produces a sparse output (constant 0 in the
-        # rightmost device coord). topk over a surviving dim of that sparse
-        # tensor must accept the zero-stick layout without forcing a restickify.
-        # Skipped: backend (dxp_standalone / topk.ddl) does not yet support sparse
-        # input tensors to topk ("None of the dimensions is mapped"); see #4732.
+        # rightmost device coord). topk.ddl does not accept sparse inputs
+        # (#4732), so the input is restickified onto a size-1 dim first.
         x = unique_randn_along_dim((32, 32, 64), dim=-1)
         self.compare_with_cpu(
             lambda x: torch.topk(torch.amax(x, dim=-1), 4, dim=-1)[0],
