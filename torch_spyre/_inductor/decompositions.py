@@ -27,7 +27,6 @@ registry; Spyre never mutates the global table.
 
 import dataclasses
 import math
-import struct
 import threading
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -3703,116 +3702,30 @@ def spyre_triu(
     return input * mask
 
 
-def _f32(value: float) -> float:
-    """Round a Python float to the nearest float32."""
-    return struct.unpack("f", struct.pack("f", value))[0]
-
-
-def _nearest_ratio(in_size: int, out_size: int, scale: Optional[float]) -> float:
-    """Source-per-output ratio, as ATen's ``compute_scales_value<float>``."""
-    if scale is not None and scale > 0:
-        return _f32(1.0 / scale)
-    return _f32(in_size / out_size)
-
-
-def _nearest_src_indices(
-    in_size: int, out_size: int, scale: Optional[float], shortcuts: bool
-) -> list[int]:
-    """Source row of every output row, as ATen's CPU nearest kernels.
-
-    The 2-D kernel goes through ``nearest_idx``, which copies when the size is
-    unchanged and halves the index when it doubles, regardless of ``scale``;
-    the 1-D kernel always applies ``scale``. The two differ only when the
-    scale does not match the size ratio (e.g. x2.1 giving exactly 2x).
-    """
-    if shortcuts and out_size == in_size:
-        return list(range(out_size))
-    if shortcuts and out_size == 2 * in_size:
-        return [j >> 1 for j in range(out_size)]
-    ratio = _nearest_ratio(in_size, out_size, scale)
-    return [
-        min(math.floor(_f32(_f32(j) * ratio)), in_size - 1) for j in range(out_size)
-    ]
-
-
-def _resize_rows_nearest(
-    input: torch.Tensor,
-    out_size: int,
-    scale: Optional[float],
-    shortcuts: bool,
-    gather_multiple: int = 1,
-) -> torch.Tensor:
-    """Nearest-resize the rows (dim -2) of ``input`` with data movement only.
-
-    Rows are a non-stick dim, so the copy is a broadcast or a single-index
-    gather; the stick dim itself is never indexed. A gather produces
-    ``out_size`` rounded up to ``gather_multiple`` rows (the extra rows repeat
-    the last source row); the caller slices them off.
-    """
-    *batch, in_size, width = input.shape
-    src = _nearest_src_indices(in_size, out_size, scale, shortcuts)
-    if src == list(range(in_size)):
-        return input
-    if out_size % in_size == 0:
-        factor = out_size // in_size
-        if src == [j // factor for j in range(out_size)]:
-            # Each row repeated ``factor`` times: [.., H, W] -> [.., H, s, W].
-            return (
-                input.unsqueeze(-2)
-                .expand(*batch, in_size, factor, width)
-                .reshape(*batch, out_size, width)
-            )
-    # Uneven repeats (e.g. x1.5): gather rows with one index, recomputed on
-    # device with the same float32 arithmetic as ATen.
-    ratio = _nearest_ratio(in_size, out_size, scale)
-    gather_size = -(-out_size // gather_multiple) * gather_multiple
-    index = torch.arange(gather_size, device=input.device, dtype=torch.float32)
-    index = torch.floor(index * ratio)
-    if math.floor(_f32(_f32(gather_size - 1) * ratio)) > in_size - 1:
-        index = torch.clamp(index, max=in_size - 1)
-    return torch.index_select(input, -2, index.to(torch.int32))
-
-
-def _spyre_upsample_nearest(
-    input: torch.Tensor,
-    output_size: Sequence[int],
-    scales: Sequence[Optional[float]],
-) -> torch.Tensor:
-    """Nearest upsample as per-axis row copies.
+def _spyre_upsample_nearest(input, output_size, scales):
+    """Nearest upsample by integer factors, as one broadcast repeat per axis.
 
     The upstream decomposition gathers with one index tensor per axis, which
-    the backend rejects (multiple indirect symbols, and no gather along the
-    stick dim). Instead each spatial axis is resized on its own as a row axis;
-    the stick (last) axis is first transposed into the row position.
+    the backend rejects. For an integer factor ``s`` the source index is just
+    ``j // s``, so each axis is moved to dim -2 (a transpose for the stick
+    axis), repeated with ``expand`` and moved back.
     """
     out = input
-    shortcuts = len(output_size) == 2
     first = input.dim() - len(output_size)
-    spatial = list(zip(range(first, input.dim()), output_size, scales))
-    # Stick axis first, while the tensor is smallest: transpose it into the
-    # row position, resize, transpose back. A gather here must produce whole
-    # sticks: transposing back a gather of e.g. 200 rows faults the card (RAS
-    # ComputeHardwareError 0x7b1b), while 256 rows sliced to 200 works.
-    # Downsampling gathers too: a strided slice is either an unsupported stick
-    # expression (stick axis) or a strided restickify input (row axis, folded
-    # into the transpose back), and materializing the stick-axis result before
-    # a row gather gives wrong values.
-    _, stick_out, stick_scale = spatial[-1]
-    rows = out.transpose(-1, -2)
-    resized = _resize_rows_nearest(
-        rows,
-        stick_out,
-        stick_scale,
-        shortcuts,
-        gather_multiple=get_elem_in_stick(input.dtype),
-    )
-    if resized is not rows:
-        out = resized.transpose(-1, -2)[..., :stick_out]
-    for dim, size, scale in spatial[:-1]:
-        rows = out.movedim(dim, -2)
-        resized = _resize_rows_nearest(rows, size, scale, shortcuts)
-        if resized is not rows:
-            out = resized.movedim(-2, dim)
+    # Stick axis first, while the tensor is smallest.
+    for dim in reversed(range(first, input.dim())):
+        in_size, out_size = input.shape[dim], output_size[dim - first]
+        s = out_size // in_size
+        # A scale off the size ratio (x2.1 giving 2x) changes the 1-D CPU index.
+        if out_size != s * in_size or scales[dim - first] not in (None, s):
+            raise Unsupported(
+                f"nearest upsample {in_size} -> {out_size}: "
+                "only integer upsampling factors"
+            )
+        if s > 1:
+            rows = out.movedim(dim, -2).unsqueeze(-2)
+            rows = rows.expand(*rows.shape[:-2], s, rows.shape[-1])
+            out = rows.flatten(-3, -2).movedim(-2, dim)
     # aten.upsample_* always returns a fresh tensor.
     return out.contiguous() if out is not input else out.clone()
 
@@ -3823,25 +3736,15 @@ def _spyre_upsample_nearest(
         torch.ops.aten.upsample_nearest2d.default,
     ]
 )
-def spyre_upsample_nearest(
-    input: torch.Tensor,
-    output_size: Sequence[int],
-    *scales: Optional[float],
-) -> torch.Tensor:
-    scales = scales or (None,) * len(output_size)
-    return _spyre_upsample_nearest(input, output_size, scales)
+def spyre_upsample_nearest(input, output_size, *scales):
+    return _spyre_upsample_nearest(input, output_size, [*scales, None, None])
 
 
 @register_spyre_decompositions(
     [torch.ops.aten.upsample_nearest1d.vec, torch.ops.aten.upsample_nearest2d.vec]
 )
-def spyre_upsample_nearest_vec(
-    input: torch.Tensor,
-    output_size: Optional[Sequence[int]],
-    scale_factors: Optional[Sequence[float]],
-) -> torch.Tensor:
+def spyre_upsample_nearest_vec(input, output_size, scale_factors):
     osize = decomp.decompositions.upsample_compute_output_size(
         input.size(), output_size, scale_factors
     )
-    scales = scale_factors if scale_factors else [None] * len(osize)
-    return _spyre_upsample_nearest(input, osize, scales)
+    return _spyre_upsample_nearest(input, osize, scale_factors or [None, None])
