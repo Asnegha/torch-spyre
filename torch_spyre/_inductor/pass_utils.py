@@ -2335,6 +2335,11 @@ def compute_restickify_target_layout(
     behaves the same whether it is real or synthetic. Any other constant is
     a stick offset, which cannot be targeted.
 
+    The 0 branch pairs with _make_output_stl in propagate_layouts.py, which
+    lets a size-1 dim be the stick. That gives a stick expression of the
+    constant 0, which matching_dim cannot resolve to a host dim, so without
+    this branch every restickify to such a layout would return None.
+
     Returns None if the restickify is infeasible.
     """
     host_size = [concretize_expr(s) for s in host_layout.size]

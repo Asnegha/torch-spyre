@@ -10974,6 +10974,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compiled(x, y)
         assert "no offset-free alternative stick dim" in str(exc_info.value)
 
+    def test_slice_stick_mutation_size1_alt_dim(self):
+        """An offset-stick slice write into [1, N] moves the stick to the size-1 dim.
+
+        Regression test for #3916, which raised "no offset-free alternative
+        stick dim" because the size-1 row could not be a stick candidate.
+        """
+
+        def fn(src):
+            out = torch.zeros(1, 256, dtype=src.dtype, device=src.device)
+            out[:, 32:160].copy_(src)
+            return out
+
+        self.compare_with_cpu(fn, cached_randn((1, 128)), run_eager=False)
+
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):
             return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]

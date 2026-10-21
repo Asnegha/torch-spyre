@@ -79,7 +79,12 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_size_in_bytes,
+)
 
 from .constants import MATMUL_REDUCTION_OPS
 from .errors import Unsupported
@@ -102,8 +107,8 @@ from .pass_utils import (
     indirect_info_from_op,
     try_device_coordinates,
 )
-from .work_division import MAX_SPAN_BYTES
 from .propagate_layouts import PropArg
+from .work_division import MAX_SPAN_BYTES
 
 # Helpers shared with enforce_indirect_access_layout.
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
@@ -116,7 +121,6 @@ from .enforce_indirect_access_layout import (
 )
 
 logger = get_inductor_logger("nonstick_dim_order")
-_STICK_BYTES = 128
 
 
 def _buf_stl(buf) -> SpyreTensorLayout | None:
@@ -463,8 +467,13 @@ def _retile_entry_per_stick(
         indirect_device_pos = len(retiled_stl.stride_map) - 1 - stride_idx
         retiled_stl = _ia_rotate_stl(retiled_stl, indirect_device_pos)
 
-    # A stick per entry, so a large table can outgrow the span limit.
-    retiled_bytes = math.prod(retiled_stl.device_size[:-1]) * _STICK_BYTES
+    # A stick per entry, so a large table can outgrow the span limit. The
+    # whole table is the per-core span: it is a shared gather table or scatter
+    # destination, at one base address on every core, any of whose rows a core
+    # may address, and indirect_forbidden_split_syms keeps work division from
+    # splitting its data dims. raise_if_per_core_overflow skips indirectly
+    # accessed tensors, so this is the only check.
+    retiled_bytes = get_device_size_in_bytes(retiled_stl)
     if retiled_bytes > MAX_SPAN_BYTES:
         raise Unsupported(
             f"cannot re-tile {dep.name}: one entry per stick would take "
