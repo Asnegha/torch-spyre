@@ -2221,6 +2221,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                 ),
             },
+            # The values and the fp16 indices are exact; the fp16 to int64 cast of
+            # the indices is not.
+            "expect_fail": {
+                "2d_k4_dim0": _STAGGERED_READBACK,
+            },
+            # The cast's fp32 value lacks the second stick of a stick pair, so it
+            # reads memory that was never written: the result is wrong on most runs
+            # and right on some, and a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "2d_batch1_k4_dim1_lt64": (
+                    "the cast's fp32 value lacks the second stick of a stick pair "
+                    "(#3999), so the indices come back wrong on most runs"
+                ),
+                "2d_batch1_k4_dim1_gt64": (
+                    "the cast's fp32 value lacks the second stick of a stick pair "
+                    "(#3999), so the indices come back wrong on some runs"
+                ),
+            },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
