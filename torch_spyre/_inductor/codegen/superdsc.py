@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import struct
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -43,6 +44,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
+    SPYRE_INT32_OPS,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
@@ -263,19 +265,34 @@ class SDSCSpec:
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
-_POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
-    "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
+# value. 0.0 (used for sum/mean) already satisfies this requirement.
+# For max and min, the largest finite values with matching upper and lower
+# 16-bit halves are constructed directly from their bit patterns.
+_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
+_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+
+_PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
+    "max": {
+        DataFormats.SEN169_FP16: _FP16_MIN,
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "min": {
+        DataFormats.SEN169_FP16: _FP16_MAX,
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "exp": {
+        DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+    },
 }
 
+_POINTWISE_PADDING_OPS: set[str] = {"exp"}
 
-def _get_mask_value(op: str) -> float:
-    if op == "max":
-        return _FP16_MIN
-    if op == "min":
-        return _FP16_MAX
-    if op in _POINTWISE_PADDING_MASK_VALUE:
-        return _POINTWISE_PADDING_MASK_VALUE[op]
-    return 0
+
+def _get_mask_value(
+    op: str, data_format: DataFormats = DataFormats.SEN169_FP16
+) -> float:
+    return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
 def _get_coordinate_mask(
@@ -286,7 +303,7 @@ def _get_coordinate_mask(
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
-    # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
+    # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
     #
     # SAMV coordinate masking is limited to <=16-bit element types by the
     # backend compiler ("Coordinate masking is supported only up to 16bit
@@ -308,7 +325,7 @@ def _get_coordinate_mask(
     # #3290 (padded-stick-state layout enum, the principled replacement for this
     # bandage).
     mask_pointwise = (
-        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+        op in _POINTWISE_PADDING_OPS and arg.data_format != DataFormats.IEEE_FP32
     )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
@@ -692,7 +709,29 @@ def _match_labels_by_structure(op_spec: "OpSpec") -> dict | None:
     # Output roles: non-stick output symbols in coordinate order are
     # [out_h, out_w, batch] (batch trails the spatial dims in the output layout).
     out_spatial = _ordered_arg_symbols(out_arg, exclude=(channel,))
-    spatial_roles = ["out_h", "out_w", "batch"]
+    # When the output height is degenerate (H_out == 1) the surviving spatial
+    # symbol is a **width** axis, so ``out_h`` must not be offered as a role.
+    # Two shapes reach here that way: a rank-3 conv1d, which
+    # ``lower_convolution`` models as a conv2d with H_in = kH = sH = 1 and whose
+    # real geometry therefore lives in the ``w`` slot; and a rank-4 conv2d whose
+    # H_out simplified to 1.  Zipping the canonical ``[out_h, out_w, batch]``
+    # order would hand the lone axis ``out_h`` -> ``i``, whose SDSC padding entry
+    # is then built from ``stride_h``/``kernel_h`` (1 for a conv1d) instead of the
+    # true width geometry, so ``totalSize_`` collapses to the output extent and
+    # every tap past the first reads the wrong element.  Measured wrong by ~55
+    # (conv1d) and ~48 (rank-4 H_out==1) at stride 2; stride 1 was correct only
+    # because stride_h == stride_w there.
+    #
+    # Keyed on H_out rather than on the rank, so both shapes are covered: rank is
+    # only a proxy, and a rank-4 conv2d with H_out == 1 has the same defect.
+    ranges = op_spec.node_output_ranges
+    height_is_degenerate = ranges is not None and (
+        len(ranges) == 3  # conv1d: no height axis at all
+        or (len(ranges) == 4 and _is_static_one(ranges[2]))  # NCHW, H_out == 1
+    )
+    spatial_roles = (
+        ["out_w", "batch"] if height_is_degenerate else ["out_h", "out_w", "batch"]
+    )
     if len(out_spatial) > len(spatial_roles):
         return None
     role_of = dict(zip(out_spatial, spatial_roles))
@@ -778,17 +817,32 @@ def _align_conv2d_dim_labels(
     ``lower_avg_pool2d`` delegates to the in-tree lowering when
     ``kH == 1 or kW == 1``, so a pool ``SpyreReduction`` always has both window
     dims, but conv2d explicitly supports 1x1 / 1xN / Nx1 kernels.
+
+    A **depthwise conv1d** arrives at rank 3, ``[N, C, W_out]``, with no height
+    entry.
     """
-    if node_output_ranges is None or len(node_output_ranges) != 4:
+    if node_output_ranges is None or len(node_output_ranges) not in (3, 4):
         raise ValueError(
-            "conv2d node_output_ranges must be NCHW [N, C, H_out, W_out]; got "
-            f"{node_output_ranges!r}"
+            "conv2d node_output_ranges must be NCHW [N, C, H_out, W_out], or "
+            f"[N, C, W_out] for a rank-3 conv1d; got {node_output_ranges!r}"
+        )
+    is_1d = len(node_output_ranges) == 3
+    if is_1d and not _is_static_one(kernel_h):
+        raise ValueError(
+            "conv1d node_output_ranges [N, C, W_out] implies a degenerate "
+            f"height, but kernel_h is {kernel_h!r}, not 1"
         )
     # Full canonical label list with each entry's unit-ness, in iteration-space
     # order: output roles (mb, out, i, j) then window roles (ki, kj).
+    range_of_role = {
+        "batch": node_output_ranges[0],
+        "channel": node_output_ranges[1],
+        "out_h": Integer(1) if is_1d else node_output_ranges[2],
+        "out_w": node_output_ranges[-1],
+    }
     candidates: list[tuple[str, bool]] = [
-        (label, _is_static_one(node_output_ranges[pos]))
-        for pos, (_role, label) in enumerate(_CONV2D_ROLE_LABELS)
+        (label, _is_static_one(range_of_role[role]))
+        for role, label in _CONV2D_ROLE_LABELS
     ]
     candidates.append((_CONV2D_WINDOW_DIM_I, _is_static_one(kernel_h)))
     candidates.append((_CONV2D_WINDOW_DIM_J, _is_static_one(kernel_w)))
@@ -1044,15 +1098,14 @@ def _build_conv2d_symbol_mapping(
     kernel_h = conv_params.get("kernel_h")
     kernel_w = conv_params.get("kernel_w")
     sym_list = list(op_spec.iteration_space.keys())
+    ranges = op_spec.node_output_ranges
 
-    if kernel_h is None or kernel_w is None or op_spec.node_output_ranges is None:
+    if kernel_h is None or kernel_w is None or ranges is None:
         # No kernel sizes or no live output ranges: keep the caller's positional
         # mapping rather than guessing.
         return {sym: Symbol(dim_labels[i]) for i, sym in enumerate(sym_list)}
 
-    labels = _align_conv2d_dim_labels(
-        op_spec.node_output_ranges, len(sym_list), kernel_h, kernel_w
-    )
+    labels = _align_conv2d_dim_labels(ranges, len(sym_list), kernel_h, kernel_w)
 
     # The label list is in canonical order (mb, out, i, j, ki, kj minus the
     # squeezed roles), but the *iteration space* is not guaranteed to be.  It is
@@ -1070,7 +1123,11 @@ def _build_conv2d_symbol_mapping(
     needs_reorder = all(lbl in labels for lbl in window_labels) and all(
         lbl in labels for lbl in spatial_labels
     )
-    if needs_reorder and _is_static_one(op_spec.node_output_ranges[2]):
+    # Rank 3 (conv1d) has no H_out entry, and position 2 there is W_out -- but a
+    # conv1d also drops i/ki, so needs_reorder is already False. Gate on the rank
+    # anyway so the index below is only ever taken against a real NCHW tuple,
+    # rather than depending on that short-circuit.
+    if needs_reorder and len(ranges) == 4 and _is_static_one(ranges[2]):
         sym_to_size = {
             sym: _concretize_for_sdsc(size)
             for sym, (size, _) in op_spec.iteration_space.items()
@@ -1121,30 +1178,32 @@ def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
 
 
 def _get_data_format(op, device_dtype):
-    """Re-label int32 tensor data formats to fp32 for SDSC compatibility.
+    """Return the SDSC descriptor format for a tensor.
 
-    NOTE: This is NOT a data conversion.
-    This is only a temporary re-labeling of the same 32 bit data.
-    The underlying data remains unchanged.
-
-    In the long term, SDSC should accept int32 as the data format.
-    Such re-labeling will become unnecessary.
-    See backend issue deeptools#4307.
+    This is metadata relabeling only; the underlying 32-bit data is unchanged.
+    Native integer add/mul (``addi32toi32`` / ``muli32toi32``) use SENUINT32
+    tensor descriptors in the SDSC DDL.  Identity retains its fp32 relabeling.
     """
-    if device_dtype == DataFormats.IEEE_INT32 and op == IDENTITY_OP:
-        return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32:
+        if op in SPYRE_INT32_OPS:
+            return DataFormats.SENUINT32
+        if op == IDENTITY_OP:
+            # In the long term, SDSC should accept int32 as the data format.
+            # Such re-labeling will become unnecessary.
+            # See backend issue deeptools#4307.
+            return DataFormats.IEEE_FP32
     return device_dtype
 
 
 def _get_sdsc_spec_data_format(op, arg_data_format):
-    """Re-label int32 ops' SDSC spec data_format to fp32 for backend compatibility.
+    """Return the SDSC compute format for an operation.
 
-    For fp32<->int32 dtype-conversion ops, the SDSC spec must report fp32 as
-    the op's data format, but unlike `_get_data_format`'s IDENTITY_OP case,
-    the int32 tensor descriptor itself stays int32.
+    dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
+    muli32toi32) must report IEEE_FP32 as the SDSC spec's compute format;
+    all other ops pass the tensor format through unchanged.
     See backend issue deeptools#4307.
     """
-    if op in (FP32TOINT32_OP, INT32TOFP32_OP):
+    if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
     return arg_data_format
 
@@ -1499,7 +1558,7 @@ def _create_sdsc_tensors(
             if (
                 dim_coord is not None
                 and not isinstance(dim_coord, IndirectAccess)
-                and dev_dim_size > it_dim_size
+                and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
@@ -1509,8 +1568,12 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op):
+                if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
+                # Overlapping views can iterate beyond an aligned physical
+                # axis (e.g. unfold's window is wider than its step). Core
+                # offsets divide this span by the work split, so use the
+                # iteration extent even when it exceeds the device extent.
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
@@ -1653,7 +1716,16 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim
 
 
-def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+def _get_op_func(
+    op: str,
+    is_reduction: bool,
+    output_scales: dict,
+) -> str:
+    """Return the SDSC opfunc string for an operation.
+
+    Non-stick reductions append the ``nonstick`` suffix.  All other ops map to
+    their op name unchanged.
+    """
     if _is_pool(op) or _is_conv(op):
         return op
     # quantscalepertokenfp8 maps directly to deeptools operator (no "nonstick" suffix)
@@ -2078,20 +2150,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
-    # require at least one outer spatial dim beyond the stick; inject a
-    # virtual mb=1 row when the op's tensor has only the stick dim.
+    # A dtype conversion that changes the elements per stick (DL16TOFP32,
+    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
+    # dim beyond the stick; inject a virtual mb=1 row when the op's tensor has
+    # only the stick dim.
     # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
+    changes_stick_width = len(op_spec.args) == 2 and (
+        op_spec.args[0].device_dtype.elems_per_stick()
+        != op_spec.args[1].device_dtype.elems_per_stick()
+    )
     mb_sym: Symbol | None = None
-    if (
-        (
-            DtypeOpTable.is_dtype_op(op_spec.op)
-            or op_spec.op == "qfp8ch"
-            or op_spec.op == QUANTSCALEPERTOKENFP8_OP
-        )
-        and op_spec.op != IDENTITY_OP
-        and (op_dim_order == [] or op_dim_order == [op_stick_dim])
-    ):
+    if changes_stick_width and (op_dim_order == [] or op_dim_order == [op_stick_dim]):
+        assert op_spec.op != IDENTITY_OP and (
+            DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op in ("qfp8ch", "qfp8wt")
+        ), f"{op_spec.op} changes the elements per stick but is not a conversion"
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
@@ -2358,7 +2430,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
+        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output
@@ -2479,13 +2551,21 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         else {}
     )
 
+    # Indirect operations place the index tensor first.
+    value_arg_index = 1 if indirect_access_indices else 0
+    opfunc = (
+        "shuffle"
+        if is_relayout
+        else _get_op_func(
+            op_spec.op,
+            op_spec.is_reduction,
+            args[-1].scales,
+        )
+    )
+
     return (
         SDSCSpec(
-            opfunc=(
-                "shuffle"
-                if is_relayout
-                else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
-            ),
+            opfunc=opfunc,
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
             # matmul; depthwise conv2d (#3510) runs on the "sfp" unit. `is_conv`
             # matches both, so dispatch forward explicitly and leave depthwise
@@ -2494,9 +2574,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if (is_matmul or op_spec.op == CONV2D_FWD_OP)
             else "sfp",
             data_format=_get_sdsc_spec_data_format(
-                op_spec.op,
-                args[1 if indirect_access_indices else 0].data_format,
-            ),  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
+                opfunc,
+                args[value_arg_index].data_format,
+            ),
             num_inputs=num_inputs,
             iteration_space=sdsc_iteration_space,
             num_cores=num_cores,
