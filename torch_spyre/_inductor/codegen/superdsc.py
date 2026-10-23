@@ -1997,6 +1997,46 @@ def _finalize_tensor_work_divisions(
         arg.work_division = effective
 
 
+def _topk_injected_dims(
+    op_spec: OpSpec,
+    op_stick_fallback_sym: Symbol | None,
+    symbol_mapping: dict,
+    sdsc_iteration_space: dict,
+    dim_splits: dict,
+    work_slices: dict,
+) -> dict[str, Symbol]:
+    """Dims the topk kernel needs that the generic SDSC layout does not give it.
+
+    - ``topk_stick_fallback_sym``: when topk has no real stick dim, every arg
+      takes this one op-level fallback stick. Step 3 of _create_sdsc_tensors
+      would otherwise pick it per arg, and could give the input and the output
+      different symbols.
+    - ``topk_missing_dim``: when every output dim is already in the input, a
+      size-1 output-only dim for the k results, added to the iteration space
+      here and to the output's dim_order by _create_sdsc_tensors.
+    """
+    injected: dict[str, Symbol] = {}
+    if op_stick_fallback_sym is not None:
+        injected["topk_stick_fallback_sym"] = op_stick_fallback_sym
+    if len(op_spec.args) >= 2:
+        input_arg = op_spec.args[0]
+        output_arg = op_spec.args[-1]
+        input_dim_order, _ = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
+        output_dim_order, _ = _get_device_dim_order(output_arg, symbol_mapping, op_spec)
+        output_only_dims = [d for d in output_dim_order if d not in input_dim_order]
+        if not output_only_dims:
+            # No new output dimension; add one to the iteration space with size 1.
+            idx = len(sdsc_iteration_space)
+            if idx < len(INPUT_DIM_LABELS):
+                missing_dim_label = INPUT_DIM_LABELS[idx]
+                topk_missing_dim = Symbol(missing_dim_label)
+                sdsc_iteration_space[topk_missing_dim] = 1
+                dim_splits[topk_missing_dim] = 1
+                work_slices[topk_missing_dim] = 1
+                injected["topk_missing_dim"] = topk_missing_dim
+    return injected
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
@@ -2186,9 +2226,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 )
 
     # Set below whenever op_stick_dim is None (pool/conv/generic fallback), but
-    # only ever consumed by the topk branch further down (see
-    # injected_dims["topk_stick_fallback_sym"]) -- other ops recompute their own
-    # per-arg fallback independently in _create_sdsc_tensors's Step 3.
+    # only ever consumed for topk (see _topk_injected_dims) -- other ops recompute
+    # their own per-arg fallback independently in _create_sdsc_tensors's Step 3.
     op_stick_fallback_sym: Symbol | None = None
     if op_stick_dim is None:
         if is_pool or _is_depthwise_conv(op_spec.op):
@@ -2266,31 +2305,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                         sdsc_iteration_space[entry_mb] = dev
                     break
 
-    # For topk: if all output dims are in the input, add a missing dimension.
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if index_stick_syms:
         injected_dims["index_stick_syms"] = index_stick_syms
-    if _is_topk(op_spec.op) and op_stick_fallback_sym is not None:
-        # Force both tensors' Step 3 fallback stick onto the same symbol,
-        # since Step 3's default picks independently per arg and can choose
-        # different symbols for topk's input vs. output.
-        injected_dims["topk_stick_fallback_sym"] = op_stick_fallback_sym
-    if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
-        input_arg = op_spec.args[0]
-        output_arg = op_spec.args[-1]
-        input_dim_order, _ = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
-        output_dim_order, _ = _get_device_dim_order(output_arg, symbol_mapping, op_spec)
-        output_only_dims = [d for d in output_dim_order if d not in input_dim_order]
-        if not output_only_dims:
-            # No new output dimension; add one to the iteration space with size 1.
-            idx = len(sdsc_iteration_space)
-            if idx < len(INPUT_DIM_LABELS):
-                missing_dim_label = INPUT_DIM_LABELS[idx]
-                topk_missing_dim = Symbol(missing_dim_label)
-                sdsc_iteration_space[topk_missing_dim] = 1
-                dim_splits[topk_missing_dim] = 1
-                work_slices[topk_missing_dim] = 1
-                injected_dims["topk_missing_dim"] = topk_missing_dim
+    if _is_topk(op_spec.op):
+        injected_dims.update(
+            _topk_injected_dims(
+                op_spec,
+                op_stick_fallback_sym,
+                symbol_mapping,
+                sdsc_iteration_space,
+                dim_splits,
+                work_slices,
+            )
+        )
 
     # For matmul N=1: inject N dimension into iteration space so y and output have it.
     if is_matmul:
