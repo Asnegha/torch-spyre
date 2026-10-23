@@ -1838,6 +1838,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     True,
                 ),
+                # Along the stick dim: neg feeds topk through a restickify.
+                "2d_dim1_asc": (unique_randn_along_dim((8, 64), dim=1), 1, False),
             },
         },
         # Stable sort along the stick dim fails on main: Inductor fuses flip's
@@ -8233,45 +8235,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(values.cpu(), expected)
         torch.testing.assert_close(x.gather(dim, indices.cpu()), expected)
 
-    def test_sort_dynamic(self):
-        # The unstable path needs no flip, so it compiles with dynamic=True. dim
-        # and descending are literals: dynamic=True would turn closure ints into
-        # SymInts.
-        cases = [
-            ((8, 64), 0, lambda x: torch.sort(x, dim=0)),
-            ((16, 64), 0, lambda x: torch.sort(x, dim=0, descending=True)),
-            ((2, 16, 64), 1, lambda x: torch.sort(x, dim=1, stable=False)),
-            # Along the stick dim: neg feeds topk through a restickify.
-            ((8, 64), 1, lambda x: torch.sort(x, dim=1)),
-        ]
-        for shape, dim, fn in cases:
-            with self.subTest(shape=shape, dim=dim):
-                x = unique_randn_along_dim(shape, dim=dim)
-                torch._dynamo.reset()
-                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
-                expected_values, expected_indices = fn(x)
-                torch.testing.assert_close(values.cpu(), expected_values)
-                torch.testing.assert_close(indices.cpu(), expected_indices)
-
-    def test_sort_stable_dynamic(self):
-        # The stable path flips the input (a gather) and maps indices back with
-        # amax, since a symbolic n can't be a pointwise constant. Inputs repeat
-        # small integers so ties check the stable order. dim and descending are
-        # literals: dynamic=True would turn closure ints into SymInts.
-        cases = [
-            ((16, 64), lambda x: torch.sort(x, dim=0, stable=True)),
-            ((16, 64), lambda x: torch.sort(x, dim=0, descending=True, stable=True)),
-            ((2, 16, 64), lambda x: torch.sort(x, dim=1, stable=True)),
-        ]
-        for shape, fn in cases:
-            with self.subTest(shape=shape):
-                x = (torch.arange(math.prod(shape)) * 7 % 5).reshape(shape).half()
-                torch._dynamo.reset()
-                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
-                expected_values, expected_indices = fn(x)
-                torch.testing.assert_close(values.cpu(), expected_values)
-                torch.testing.assert_close(indices.cpu(), expected_indices)
-
     def test_sort_unsplittable_with_inf(self):
         # The pad for an unsplittable sort dim is -inf in topk's key space and
         # sits at the front, so it loses every tie with a real +-inf element.
@@ -8302,41 +8265,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
         )
 
-    def test_topk_dynamic_k_split(self):
-        # k > TOPK_MAX_K_PER_CORE (4) must split the k dim across cores. Under
-        # dynamic=True the output's symbolic stride used to be taken for a
-        # scatter row, pinning that dim unsplit ("conflicting legal split
-        # domains"). k and dim are literals: dynamic=True would turn closure
-        # ints into SymInts, which tests a symbolic k rather than a symbolic
-        # shape.
-        cases = [
-            ((8, 64), 0, lambda x: torch.topk(x, 8, dim=0)),
-            ((16, 64), 0, lambda x: torch.topk(x, 8, dim=0)),
-            ((8, 8), 0, lambda x: torch.topk(x, 8, dim=0)),
-            ((128, 64), 0, lambda x: torch.topk(x, 128, dim=0)),
-        ]
-        for shape, dim, fn in cases:
-            with self.subTest(shape=shape, dim=dim):
-                x = unique_randn_along_dim(shape, dim=dim)
-                torch._dynamo.reset()
-                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
-                expected_values, expected_indices = fn(x)
-                torch.testing.assert_close(values.cpu(), expected_values)
-                torch.testing.assert_close(indices.cpu().long(), expected_indices)
-
-    def test_topk_dynamic_restickified_producer(self):
-        # A computed producer (neg) feeding topk along the stick dim needs a
-        # restickify. Under dynamic=True the planned read index kept the
-        # symbolic stride while the live load used the concrete one, so the
-        # swap was skipped and topk read the stick-dim buffer
-        # (OpSpecValidationError).
-        x = unique_randn_along_dim((8, 64), dim=1)
-        torch._dynamo.reset()
-        fn = lambda x: torch.topk(-x, 4, dim=1)  # noqa: E731
-        values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
-        expected_values, expected_indices = fn(x)
-        torch.testing.assert_close(values.cpu(), expected_values)
-        torch.testing.assert_close(indices.cpu().long(), expected_indices)
+    @expects_raise
+    def test_sort_k_over_max_rejected(self):
+        # topk caps k at 128, and sort runs it with k = size of the sort dim.
+        x = unique_randn_along_dim((129, 8), dim=0)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)

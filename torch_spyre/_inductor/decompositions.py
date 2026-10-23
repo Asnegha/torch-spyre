@@ -33,10 +33,10 @@ from typing import Any, Callable, Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
-from torch.fx.experimental.symbolic_shapes import guard_int
 
-from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN, TOPK_MAX_K_PER_CORE
+from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN, TOPK_MAX_K
 from .errors import Unsupported
+from .work_division_constraints import legal_topk_k_splits
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
     STICK,
@@ -1821,8 +1821,8 @@ def spyre_topk(
     largest: bool = True,
     sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 128:
-        raise Unsupported(f"topk with k={k} is not supported (max k=128)")
+    if k > TOPK_MAX_K:
+        raise Unsupported(f"topk with k={k} is not supported (max k={TOPK_MAX_K})")
     if not largest:
         raise Unsupported("topk with largest=False")
     # sorted=False is a no-op: our reduction always returns sorted output.
@@ -1830,18 +1830,6 @@ def spyre_topk(
     # fake reports it so Dynamo traces it with no meta conflict.
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
-    )
-
-
-def _topk_k_splits(k: int) -> bool:
-    """Whether topk can split ``k`` results evenly across the cores.
-
-    Mirrors ``topk_split_domains``: some core count up to ``config.sencores``
-    must divide ``k`` with at most ``TOPK_MAX_K_PER_CORE`` results per core.
-    """
-    return any(
-        k % cores == 0 and k // cores <= TOPK_MAX_K_PER_CORE
-        for cores in range(1, config.sencores + 1)
     )
 
 
@@ -1862,9 +1850,7 @@ def spyre_sort(
     highest index first. That order is allowed unless ``stable=True``; then
     the input is flipped along ``dim`` beforehand, so the highest flipped
     index is the lowest original one (the stable order), and ``(n - 1) - i``
-    maps a flipped index back. With dynamic shapes ``n`` is symbolic, which a
-    Spyre pointwise op cannot take as a constant; the flipped indices are a
-    permutation of ``0 .. n-1``, so their ``amax`` along ``dim`` is ``n - 1``.
+    maps a flipped index back.
     """
     if input.numel() == 0:
         # Nothing to reorder, and topk rejects zero-size tensors.
@@ -1879,25 +1865,30 @@ def spyre_sort(
     if not input.dtype.is_floating_point:
         # topkvalue/topkindex (and neg) only bind fp16/fp32 in DeepTools.
         raise Unsupported(f"sort on a non-floating-point input: {input.dtype}")
-    key = torch.flip(input, [dim]) if stable else input
-    if not descending:
-        key = -key
+    if not isinstance(n, int):
+        # k = n must be a concrete topk size.
+        raise Unsupported(f"sort along a dim of symbolic size {n}")
+    if n > TOPK_MAX_K:
+        raise Unsupported(
+            f"sort along a dim of size {n} is not supported (max {TOPK_MAX_K})"
+        )
     # topk needs k = n to split evenly across cores. When it can't (e.g. a
     # prime n > 32), front-pad the key with -inf up to the next k that can.
     # Among equal keys topk emits the highest index first, so a pad comes out
     # after any real element it ties with: the pads are always the last
     # k - n results, even when the input holds infinities.
-    k, pad = n, 0
-    if isinstance(n, int) and not _topk_k_splits(n):
-        k = next(
-            (
-                m
-                for m in range(n, config.sencores * TOPK_MAX_K_PER_CORE + 1)
-                if _topk_k_splits(m)
-            ),
-            n,
+    k = next(
+        (m for m in range(n, TOPK_MAX_K + 1) if legal_topk_k_splits(m)), None
+    )
+    if k is None:
+        raise Unsupported(
+            f"sort along a dim of size {n}: no size in [{n}, {TOPK_MAX_K}] "
+            f"splits across {config.sencores} cores"
         )
-        pad = k - n
+    pad = k - n
+    key = torch.flip(input, [dim]) if stable else input
+    if not descending:
+        key = -key
     if pad:
         key = torch.constant_pad_nd(
             key, [0, 0] * (input.dim() - 1 - dim) + [pad, 0], float("-inf")
@@ -1911,9 +1902,7 @@ def spyre_sort(
     if pad:
         values = values.narrow(dim, 0, n)
         indices = indices.narrow(dim, 0, n) - pad
-    if stable and isinstance(n, torch.SymInt):
-        indices = torch.amax(indices, dim, keepdim=True) - indices
-    elif stable:
+    if stable:
         indices = (n - 1) - indices
     return values, indices.to(torch.int64)
 
@@ -3814,10 +3803,7 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
         # at offset 0, so it stays stick-aligned.
         pad = 0
         if dim % out.dim() == out.dim() - 1:
-            # With dynamic shapes the pad would be symbolic, which the
-            # constant_pad_nd lowering can't take; guarding on it only fixes
-            # size % stick, so other sizes keep sharing the graph.
-            pad = guard_int(-size % get_elem_in_stick(out.dtype))
+            pad = -size % get_elem_in_stick(out.dtype)
         if pad and len(reversed_dims) > 1:
             # A padded last-dim flip after another dim's gather compiles to a
             # kernel chain that triggers a device ComputeHardwareError.
