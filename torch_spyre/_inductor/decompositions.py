@@ -1877,9 +1877,7 @@ def spyre_sort(
     # Among equal keys topk emits the highest index first, so a pad comes out
     # after any real element it ties with: the pads are always the last
     # k - n results, even when the input holds infinities.
-    k = next(
-        (m for m in range(n, TOPK_MAX_K + 1) if legal_topk_k_splits(m)), None
-    )
+    k = next((m for m in range(n, TOPK_MAX_K + 1) if legal_topk_k_splits(m)), None)
     if k is None:
         raise Unsupported(
             f"sort along a dim of size {n}: no size in [{n}, {TOPK_MAX_K}] "
