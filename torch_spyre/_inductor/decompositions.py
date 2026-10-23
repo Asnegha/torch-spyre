@@ -3235,7 +3235,10 @@ def _is_direct_conv_supported(
     the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
     downstream as a hard Unsupported, not silent wrong numerics.
     """
-    kH, kW = weight_shape[-2], weight_shape[-1]
+    # A rank-3 (conv1d) weight is [C_out, C_in_per_group, K_w], so shape[-2] is
+    # the input-channel count, not a kernel height. For conv1d, kH is always 1
+    kH = 1 if len(weight_shape) == 3 else weight_shape[-2]
+    kW = weight_shape[-1]
     C_in = input_shape[1]
     eps = get_elem_in_stick(torch.float16)
     supported = (
@@ -3244,7 +3247,8 @@ def _is_direct_conv_supported(
         and all(p == 0 for p in padding)
         and all(d == 1 for d in dilation)
         and groups == 1
-        and len(input_shape) == 4
+        # Expand acceptable dim count to include 3 to support conv1d
+        and len(input_shape) in (3, 4)
         and input_dtype == torch.float16
         and not (kH == 1 and kW == 1)
         # Dense conv k>3 overflows the LX contraction budget in the backend.
@@ -3335,7 +3339,7 @@ def conv2d_via_bmm_decomp(
     #
     # NOTE: this first call passes the *original* input shape, so for a
     # 5-dimensional (Conv3D) input it always returns False -- _is_direct_conv_
-    # supported gates on len(input_shape) == 4. The direct deferral for a
+    # supported gates on len(input_shape) in (3, 4). The direct deferral for a
     # temporal-1 Conv3D is decided later, by the *second* call below on the
     # folded 4D shapes; here a 5D input simply proceeds into the fold branch.
     if _will_lower_conv2d_direct(
@@ -3357,6 +3361,49 @@ def conv2d_via_bmm_decomp(
     if any(op != 0 for op in output_padding):
         raise Unsupported("conv2d_via_bmm: output_padding not supported")
 
+    # conv1d (rank-3 activation) splits by whether it is depthwise.
+    #
+    # Depthwise goes to spyre.conv2d, which handles a rank-3 activation natively.
+    #
+    # The general case (C_in != C_out, or any grouping that is not depthwise) is
+    # direct-lowered at rank 3 too when _is_direct_conv_supported accepts it.
+    #
+    # This function is reached only when direct lowering returns NotImplemented
+    #
+    # That leaves the im2col+matmul fallback, which needs rank 4, so needed expansion
+    # is performed via unsqueeze.
+    if input.dim() == 3:
+        C_in = input.shape[1]
+        C_out = weight.shape[0]
+        if C_in == groups == C_out:
+            return torch.ops.spyre.conv2d_with_bias(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            raise Unsupported(
+                f"conv2d_via_bmm: conv1d expects 1-element stride/padding/"
+                f"dilation, got stride={stride}, padding={padding}, "
+                f"dilation={dilation}"
+            )
+        input = input.unsqueeze(2)
+        weight = weight.unsqueeze(2)
+        stride = [1, stride[0]]
+        padding = [0, padding[0]]
+        dilation = [1, dilation[0]]
+        # The trailing reshape below restores rank 4 as (N, C_out, 1, W_out);
+        # squeeze the degenerate height back out so the result matches the
+        # rank-3 shape aten.convolution promises for a 1-D conv.
+        return conv2d_via_bmm_decomp(
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+        ).squeeze(2)
     if input.dim() == 5:
         # A Conv3D with a unit temporal (depth) kernel is a *batched* Conv2d:
         # with kD == 1 (and unit depth stride, zero depth pad, unit depth
@@ -3636,11 +3683,14 @@ def spyre_conv2d_with_bias_decomp(
 
     # If bias is present, add it
     if bias is not None:
-        # Get output shape
-        N, C_out, H_out, W_out = output.shape
-        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
-        # This avoids stick layout issues by expanding before adding
-        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        # Reshape bias to a channel vector with unit spatial dims, then expand to
+        # the output shape; expanding before the add avoids stick layout issues.
+        # The rank follows the output's: 4 for conv2d, 3 for a depthwise conv1d
+        # so the shapes are built from output.shape.
+        out_shape = list(output.shape)
+        C_out = out_shape[1]
+        bias_shape = [1, C_out] + [1] * (len(out_shape) - 2)
+        bias_expanded = bias.reshape(bias_shape).expand(out_shape)
         output = output + bias_expanded
 
     return output
@@ -3830,23 +3880,14 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
 def spyre_prod_dim_int(
     input: torch.Tensor, dim: int, keepdim: bool = False
 ) -> torch.Tensor:
-    # int64 is converted to fp32 for now, so it stays on the decomposition
-    # path below.
-    if input.dtype != torch.int64:
-        return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
-
-    if dim < 0:
-        dim += input.ndim
-    out_shape = list(input.shape)
-    reduce_size = out_shape.pop(dim)
-    acc = torch.ones(out_shape, dtype=input.dtype, device=input.device)
-    for i in range(reduce_size):
-        acc = acc * input.select(dim, i)
-
-    if keepdim:
-        acc = acc.unsqueeze(dim)
-
-    return acc
+    # All dtypes route through spyre.prod_dim_int.  For int64, lower_prod_dim
+    # uses with_int64_fallback which converts the input to fp32 via one CPU
+    # round-trip before the hardware reduction.  Stick-dim reductions fail at
+    # compile time (NotImplementedError "no mechanism to resolve stick
+    # incompatibility") until ReStickifyOpHBM supports fp32 (issue #2544; the
+    # CPU fallback is to be removed by issue #5126).  Those cases are
+    # expect_fail in test_prod_cpu; remove the entries when the issues land.
+    return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
 
 
 @register_spyre_decompositions(
@@ -3960,12 +4001,13 @@ def spyre_masked_scatter(
         "masked_scatter: source is too short -- it has fewer rows than the "
         "number of selected (True) mask rows.",
     )
-    # Row i reads source row (prefix-count of selected rows - 1). Unselected
-    # rows would get -1, so multiply by the mask to send them to row 0 instead
-    # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
-    # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
+    # Row i reads source row (prefix-count of selected rows - 1). An unselected
+    # row reads the last selected row before it, or -1 before the first one;
+    # clamping to 0 keeps every index in bounds, and the where discards what the
+    # unselected rows read. Done in fp32: Spyre has no usable int `clip`, int32
+    # sub/mul are unsupported, and fp16 loses large indices.
     pos = mask_row.cumsum(0).to(torch.float32) - 1.0
-    row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
+    row_idx = pos.clamp(min=0.0).to(torch.int64)
     # The gather stays 2D (its args are indirect, so the pointwise dim_order
     # projection skips them), but the `where` must stay at `self`'s rank:
     # that projection computes `rank_diff = len(output) - len(arg)` and only
@@ -4009,6 +4051,148 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+
+def _grouped_mm_capacity(n: int, num_experts: int) -> int:
+    """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
+
+    Computed from static shapes only so the decomposition stays traceable.
+    compute_grouped_mm_routing_tables raises at runtime if any segment exceeds it.
+    """
+    per_expert = (n + num_experts - 1) // num_experts
+    return max(64, min(n, ((per_expert + 63) // 64) * 64 * 2))
+
+
+@register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
+def spyre_grouped_mm(
+    self: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Decomposition of aten._grouped_mm covering all 4 upstream shape variants:
+
+    1. 2D x 3D with offs (mat_a [T, K] x mat_b [E, K, N]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, capacity, K] @ [E, K, N]
+       -> On-device Unpack (index_select) -> out [T, N].
+    2. 3D x 3D without offs (mat_a [E, M, K] x mat_b [E, K, N]):
+       Direct 3D BMM -> out [E, M, N].
+    3. 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, M, K] @ [E, K, capacity]
+       -> On-device Unpack (index_select) -> out [M, T].
+    4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
+       On-device Pack along reduction dim K -> Direct 3D BMM [E, M, capacity] @ [E, capacity, N]
+       -> out [E, M, N].
+
+    Scope and known limitations:
+      * BF16 only (upstream's meta rejects bias, a non-default out_dtype, and
+        fp16 off CUDA).
+      * `offs` must be a Spyre tensor. Eager calls with a CPU `offs` are
+        rejected by `_OPWrapper`'s device check (upstream accepted them).
+      * Per-expert capacity is static: 2 * ceil_to_64(n / num_experts),
+        clamped to [64, n]. A segment larger than that raises RuntimeError in
+        compute_grouped_mm_routing_tables; see #5534.
+    """
+    # Upstream's meta rejects bias and any out_dtype other than the input dtype
+    # for the dtypes Spyre supports (bf16), so these are never legitimately set.
+    assert bias is None, "Spyre grouped_mm does not support bias"
+    assert out_dtype is None or out_dtype == self.dtype, (
+        "Spyre grouped_mm does not support out_dtype != input dtype"
+    )
+
+    a_is_2d = self.dim() == 2
+    b_is_2d = mat2.dim() == 2
+
+    if a_is_2d and not b_is_2d:
+        assert offs is not None, "2D x 3D grouped_mm requires offs"
+        total_tokens: int = self.shape[0]
+        K: int = self.shape[1]
+        num_experts: int = mat2.shape[0]
+        N: int = mat2.shape[-1]
+
+        capacity = _grouped_mm_capacity(total_tokens, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, total_tokens, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
+
+        zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
+        self_with_zero = torch.cat([self, zero_row], dim=0)
+        padded_a = torch.index_select(self_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+
+        padded_out = torch.bmm(padded_a, mat2.contiguous())
+        flat_out = padded_out.reshape(num_experts * capacity, N)
+        out = torch.index_select(flat_out, 0, dst_indices)
+
+    elif not a_is_2d and not b_is_2d:
+        out = torch.bmm(self, mat2.contiguous())
+
+    elif not a_is_2d and b_is_2d:
+        assert offs is not None, "3D x 2D grouped_mm requires offs"
+        num_experts = self.shape[0]
+        M = self.shape[1]
+        K = self.shape[2]
+        T = mat2.shape[1]
+
+        capacity = _grouped_mm_capacity(T, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, T, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
+
+        b_2d_T = mat2.transpose(0, 1).contiguous()
+        zero_row = torch.zeros(1, K, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([b_2d_T, zero_row], dim=0)
+        padded_b_T = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+        padded_b = padded_b_T.transpose(-1, -2).contiguous()
+
+        padded_out = torch.bmm(self, padded_b)
+        flat_padded_out_T = (
+            padded_out.transpose(1, 2).reshape(num_experts * capacity, M).contiguous()
+        )
+        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)
+        out = out_T.transpose(0, 1).contiguous()
+
+    elif a_is_2d and b_is_2d:
+        assert offs is not None, "2D x 2D grouped_mm requires offs"
+        num_experts = offs.shape[0]
+        M = self.shape[0]
+        K_total = self.shape[1]
+        N = mat2.shape[1]
+
+        capacity = _grouped_mm_capacity(K_total, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, K_total, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+
+        a_T = self.transpose(0, 1).contiguous()
+        zero_row_a = torch.zeros(1, M, dtype=self.dtype, device=self.device)
+        a_with_zero = torch.cat([a_T, zero_row_a], dim=0)
+        padded_a_T = torch.index_select(a_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, M
+        )
+        padded_a = padded_a_T.transpose(-1, -2).contiguous()
+
+        zero_row_b = torch.zeros(1, N, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([mat2, zero_row_b], dim=0)
+        padded_b = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, N
+        )
+
+        out = torch.bmm(padded_a, padded_b)
+
+    return out
 
 
 @register_spyre_decompositions([torch.ops.aten.triu.default])

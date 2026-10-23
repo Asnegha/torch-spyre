@@ -724,6 +724,37 @@ def spyre_conv2d(
     pass
 
 
+def _conv_output_shape(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+) -> list[int]:
+    """Output shape for spyre.conv2d, for a rank-3 (1-D) or rank-4 (2-D) input.
+
+    Rank 3 is a conv1d, which is lowered natively at rank 3 rather than via a
+    reshape to rank 4 (``lower_depthwise_conv2d`` for the depthwise case,
+    ``lower_convolution`` for the direct path), so the output keeps the input's
+    rank: ``(N, C_in, L) -> (N, C_out, L_out)``.  ``C_out`` is read from the
+    weight's dim 0, which holds for both, so the arithmetic is grouping-agnostic.
+    """
+    if input.dim() == 3:
+        N, _C_in, L_in = input.shape
+        C_out, _C_in_g, kL = weight.shape
+        L_out = (L_in + 2 * padding[0] - dilation[0] * (kL - 1) - 1) // stride[0] + 1
+        return [N, C_out, L_out]
+
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    return [N, C_out, H_out, W_out]
+
+
 @spyre_conv2d.register_fake
 def _(
     input: torch.Tensor,
@@ -733,15 +764,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    # Compute output shape: (N, C_out, H_out, W_out)
-    N, C_in, H_in, W_in = input.shape
-    C_out, C_in_g, kH, kW = weight.shape
-
-    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
-
-    output_shape = [N, C_out, H_out, W_out]
-    return input.new_empty(output_shape)
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op(
@@ -769,15 +792,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    # Compute output shape: (N, C_out, H_out, W_out)
-    N, C_in, H_in, W_in = input.shape
-    C_out, C_in_g, kH, kW = weight.shape
-
-    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
-
-    output_shape = [N, C_out, H_out, W_out]
-    return input.new_empty(output_shape)
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
@@ -1341,6 +1356,94 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
+@torch.library.custom_op(
+    "spyre::compute_grouped_mm_routing_tables",
+    mutates_args=(),
+)
+def compute_grouped_mm_routing_tables(
+    offs: torch.Tensor,
+    total_tokens: int,
+    num_experts: int,
+    capacity: int,
+) -> torch.Tensor:
+    """Compute index tables on CPU for the on-device pack/BMM/unpack grouped_mm path.
+
+    capacity is passed in by the decomposition (computed from static input shapes),
+    so the real kernel and register_fake always agree on output shapes without any
+    data-dependent computation here.
+
+    Returns ONE packed int32 tensor of shape [num_experts * capacity + total_tokens]
+    (a single output keeps this a single-output FallbackKernel, which is what lets
+    mark_lx_safe take effect; a tuple return lowers to a multi-output kernel that
+    LX context switching skips). The decomposition slices it:
+      packed[:num_experts * capacity]  (src_indices) — maps each slot in padded_a
+                   [num_experts, capacity, K] to a row in mat_a, or to total_tokens
+                   (the appended zero-row) for padding slots.
+      packed[num_experts * capacity:]  (dst_indices) — maps each output token to
+                   its position in flat padded_out [num_experts * capacity, N].
+    """
+    offs_cpu = offs.to("cpu", dtype=torch.int32)
+    offs_list = offs_cpu.tolist()
+
+    if len(offs_list) != num_experts:
+        raise ValueError(
+            f"compute_grouped_mm_routing_tables: offs has {len(offs_list)} entries "
+            f"but num_experts={num_experts}"
+        )
+    prev = 0
+    for e, end in enumerate(offs_list):
+        if end < prev:
+            raise ValueError(
+                f"compute_grouped_mm_routing_tables: offs must be non-decreasing "
+                f"and non-negative, but offs[{e}]={end} follows {prev}"
+            )
+        prev = end
+    if prev > total_tokens:
+        raise ValueError(
+            f"compute_grouped_mm_routing_tables: offs[-1]={prev} exceeds "
+            f"total_tokens={total_tokens}"
+        )
+
+    src_indices = torch.full((num_experts * capacity,), total_tokens, dtype=torch.int32)
+    dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
+
+    start = 0
+    for e in range(num_experts):
+        end = offs_list[e]
+        count = end - start
+        if count > capacity:
+            # TODO(#5534): support overflow via multiple tiles per expert so
+            # that arbitrarily skewed distributions work without raising here.
+            raise RuntimeError(
+                f"compute_grouped_mm_routing_tables: expert {e} has {count} tokens "
+                f"but capacity={capacity}.  "
+                f"(total_tokens={total_tokens}, num_experts={num_experts})"
+            )
+        if count > 0:
+            slot_start = e * capacity
+            src_indices[slot_start : slot_start + count] = torch.arange(
+                start, start + count, dtype=torch.int32
+            )
+            dst_indices[start : start + count] = torch.arange(
+                slot_start, slot_start + count, dtype=torch.int32
+            )
+        start = end
+
+    return torch.cat([src_indices, dst_indices]).to(device=offs.device)
+
+
+@compute_grouped_mm_routing_tables.register_fake
+def _(
+    offs: torch.Tensor,
+    total_tokens: int,
+    num_experts: int,
+    capacity: int,
+) -> torch.Tensor:
+    return torch.empty(
+        num_experts * capacity + total_tokens, dtype=torch.int32, device=offs.device
+    )
+
+
 # LX-safe means: this op's eager body generates no intermediate buffer that
 # could get pinned to LX (today, that requires a nested torch.compile; plain
 # CPU work or a body that never touches a spyre tensor has nothing to plan).
@@ -1352,6 +1455,7 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
