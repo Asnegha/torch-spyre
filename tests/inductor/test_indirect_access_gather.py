@@ -77,7 +77,7 @@ from torch_spyre._C import (  # noqa: E402
 )
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
-from utils_inductor import mock_backend_compiler
+from utils_inductor import expects_raise, mock_backend_compiler
 
 
 class _GatherScenarios:
@@ -1592,17 +1592,20 @@ class _Gather1DTableScenario:
 
     # --- known gap ---------------------------------------------------------
 
-    @pytest.mark.skip(
-        reason="Issues #2544 / #2560: RESTICKIFY_OP is not in SPYRE_FP32_OPS"
-    )
+    @expects_raise
     def test_gather_1d_table_float32(self):
         """float32, which puts 32 elements in a stick instead of 64.
 
         Re-tiling works; the restickify it needs is not registered for float32.
         """
+        # TODO(#2544): when fp32 restickify lands this stops raising, and the
+        # test has to become a positive one.
         x = self.to_spyre(torch.arange(192, dtype=torch.float32))
         i = torch.arange(192, dtype=torch.int32).to("spyre")
-        run_e2e(self, lambda x, i: x[i], x, i)
+        with pytest.raises(
+            Exception, match=r"ReStickifyOpHBM on DataFormats\.IEEE_FP32"
+        ):
+            run_e2e(self, lambda x, i: x[i], x, i)
 
 
 register_multicore_variants(

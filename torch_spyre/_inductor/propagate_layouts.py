@@ -1762,8 +1762,6 @@ def _multi_arg_pointwise_layouts(
             )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            # Count before the synthetic-stick sentinel below pads c_in_size.
-            num_non_unit_dims = sum(1 for size in c_in_size if size != 1)
             if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
                 c_in_size.append(0)
                 c_in_stride.append(0)
@@ -1786,10 +1784,7 @@ def _multi_arg_pointwise_layouts(
                 # Check if stick coordinate depends on any index symbol
                 for index_sym in ind_sizes:
                     if index_sym in stick_coord.free_symbols:
-                        # One non-unit dim leaves nowhere else to put the
-                        # index, so let it through and re-tile it later.
-                        if num_non_unit_dims > 1:
-                            return False
+                        return False
         return True
 
     results: list[SpyreTensorLayout] = []

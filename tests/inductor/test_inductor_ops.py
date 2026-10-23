@@ -4157,8 +4157,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 56), dtype=torch.float16),
                 ),
             },
-            # restickify is fp16-only (ReStickifyOpHBM)
-            "expect_fail": ["2d_dim1_unaligned_fp32"],
+            # TODO(#2544): ReStickifyOpHBM is fp16-only, so the layout pass finds
+            # no feasible fp32 layout. When fp32 restickify lands this stops
+            # raising, and the case has to become a positive one.
+            "expect_raise": {
+                "2d_dim1_unaligned_fp32": (
+                    "no mechanism to resolve stick incompatibility"
+                ),
+            },
         },
         (
             "test_pad",
@@ -4286,8 +4292,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (0, 28),
                 ),
             },
-            # restickify is fp16-only (ReStickifyOpHBM)
-            "expect_fail": ["2d_last_dim_unaligned_fp32"],
+            # TODO(#2544): ReStickifyOpHBM is fp16-only, so the layout pass finds
+            # no feasible fp32 layout. When fp32 restickify lands this stops
+            # raising, and the case has to become a positive one.
+            "expect_raise": {
+                "2d_last_dim_unaligned_fp32": (
+                    "no mechanism to resolve stick incompatibility"
+                ),
+            },
         },
         (
             "test_fallback",

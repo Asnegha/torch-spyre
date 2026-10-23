@@ -603,15 +603,12 @@ def _try_scatter_ia_constraint(
     expected_pos = list(range(len(indirect_stride_idxs)))
     if indirect_device_pos == expected_pos:
         return None
-    if indirect_stride_idxs[0] == 0:
-        new_stl = _retile_entry_per_stick(
-            stl, buf_layout, write_dep, op, access_subs, sizes
-        )
-    else:
-        # Rotate the last (innermost) indirect dim to position 0, reproducing
-        # the pre-#5213 behavior from enforce_indirect_access_layout.py which
-        # scanned write coords right-to-left and rotated the first hit.
-        new_stl = _ia_rotate_stl(stl, indirect_device_pos[-1])
+    # Move the last (innermost) indirect dim to position 0, reproducing the
+    # pre-#5213 behavior from enforce_indirect_access_layout.py which scanned
+    # write coords right-to-left and rotated the first hit.
+    new_stl = _ia_required_stl(
+        stl, indirect_stride_idxs[0], buf_layout, write_dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
