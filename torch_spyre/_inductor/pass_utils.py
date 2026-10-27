@@ -2433,14 +2433,18 @@ def compute_size1_restickify_layout(
     )
     if old_sd_outer_dim is None:
         return None
-    # Reuse a device dim whose coordinate is the literal 0 (a real size-1 dim, or
-    # padding). Without one, the old stick's elements take over its own outer
-    # dim, one element per stick.
+    # Reuse a device dim of size 1 whose coordinate is the literal 0 (a real size-1
+    # dim, or padding). A larger dim can also read as 0 when the access is pinned
+    # to its first entry (e.g. x[0] of a [64, 128] tensor); reusing it would drop
+    # the rest of the buffer from the layout. Without one, the old stick's
+    # elements take over its own outer dim, one element per stick.
     new_sd_outer_dim = next(
         (
             j
             for j in range(len(idc) - 1)
-            if j != old_sd_outer_dim and idc[j] == sympy.S.Zero
+            if j != old_sd_outer_dim
+            and idc[j] == sympy.S.Zero
+            and stl.device_size[j] == 1
         ),
         old_sd_outer_dim,
     )
