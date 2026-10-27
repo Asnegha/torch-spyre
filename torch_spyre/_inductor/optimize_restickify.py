@@ -32,7 +32,8 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import DataFormats, SpyreTensorLayout, get_device_size_in_bytes
+from .constants import RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT
 from .pass_utils import (
     compute_restickify_needed,
     compute_size1_restickify_target,
@@ -91,7 +92,9 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible, the input device size in bytes weighted by the
+        device dtype (RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT; 32-bit formats cost 2x fp16
+        per byte) if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
@@ -122,7 +125,10 @@ class EdgeCostMap:
             cost = INF  # infeasible restickify
             self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
         else:
-            cost = float(math.prod(in_stl.device_size))
+            cost = float(
+                get_device_size_in_bytes(in_stl)
+                * RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT[in_stl.device_dtype]
+            )
             self._layout[in_stl][target_stl] = tgt
         self._cost[in_stl][target_stl] = cost
 

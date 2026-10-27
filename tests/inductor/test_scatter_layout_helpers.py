@@ -39,7 +39,6 @@ from torch_spyre._inductor.nonstick_dim_order import (
     _is_permutation_of,
     _retile_entry_per_stick,
 )
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.op_spec import IndirectAccess
 from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
@@ -295,21 +294,6 @@ class TestDenseScatterSourceStl(unittest.TestCase):
                 source_stl.element_arrangement,
             ),
         )
-
-    def test_rejects_non_dl16_source(self):
-        host_size = [64, 32]
-        host_stride = [32, 1]
-        source_stl = SpyreTensorLayout(host_size, torch.float32)
-        layout = FixedTiledLayout(
-            torch.device("spyre"),
-            torch.float32,
-            host_size,
-            host_stride,
-            source_stl,
-        )
-
-        with self.assertRaisesRegex(Unsupported, "ReStickifyOpHBM does not support"):
-            _dense_scatter_source_stl(layout)
 
 
 if __name__ == "__main__":

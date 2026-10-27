@@ -77,7 +77,7 @@ from torch_spyre._C import (  # noqa: E402
 )
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
-from utils_inductor import expects_raise, mock_backend_compiler
+from utils_inductor import mock_backend_compiler
 
 
 class _GatherScenarios:
@@ -1590,23 +1590,6 @@ class _Gather1DTableScenario:
             self._operand((24, 8)),
         )
 
-    # --- known gap ---------------------------------------------------------
-
-    @expects_raise
-    def test_gather_1d_table_float32(self):
-        """float32, which puts 32 elements in a stick instead of 64.
-
-        Re-tiling works; the restickify it needs is not registered for float32.
-        """
-        # TODO(#2544): when fp32 restickify lands this stops raising, and the
-        # test has to become a positive one.
-        x = self.to_spyre(torch.arange(192, dtype=torch.float32))
-        i = torch.arange(192, dtype=torch.int32).to("spyre")
-        with pytest.raises(
-            Exception, match=r"ReStickifyOpHBM on DataFormats\.IEEE_FP32"
-        ):
-            run_e2e(self, lambda x, i: x[i], x, i)
-
 
 register_multicore_variants(
     _Gather1DTableScenario,
@@ -1614,6 +1597,20 @@ register_multicore_variants(
     globals(),
     counts=(1, 32),
 )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.int32, torch.int64], ids=lambda d: str(d)[6:]
+)
+def test_gather_stick_indexed_32bit_rejected(dtype):
+    """A 1-D 32-bit gather indexes along the stick dim and is refused at compile
+    time (#4360) rather than faulting the device or returning wrong values."""
+    torch._dynamo.reset()
+    x = torch.arange(64).to(dtype).to("spyre")
+    idx = torch.tensor([3, 17, 40, 5], dtype=torch.int32).to("spyre")
+    with pytest.raises(Exception, match=r"indexed along its stick dimension \(#4360\)"):
+        torch.compile(lambda x, i: x[i])(x, idx)
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
