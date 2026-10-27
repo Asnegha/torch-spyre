@@ -39,6 +39,7 @@ from torch_spyre._inductor.nonstick_dim_order import (
     _is_permutation_of,
     _retile_entry_per_stick,
 )
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.op_spec import IndirectAccess
 from torch_spyre._inductor.work_division import MAX_SPAN_BYTES

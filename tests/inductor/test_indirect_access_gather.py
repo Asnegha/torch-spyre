@@ -1602,14 +1602,14 @@ register_multicore_variants(
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.int32, torch.int64], ids=lambda d: str(d)[6:]
 )
-def test_gather_stick_indexed_32bit_rejected(dtype):
-    """A 1-D 32-bit gather indexes along the stick dim and is refused at compile
-    time (#4360) rather than faulting the device or returning wrong values."""
+def test_gather_stick_indexed_32bit(dtype):
+    """A 1-D 32-bit gather indexes along the stick dim (#4360). The table is
+    re-tiled to one entry per stick, so it reads back exactly."""
     torch._dynamo.reset()
-    x = torch.arange(64).to(dtype).to("spyre")
-    idx = torch.tensor([3, 17, 40, 5], dtype=torch.int32).to("spyre")
-    with pytest.raises(Exception, match=r"indexed along its stick dimension \(#4360\)"):
-        torch.compile(lambda x, i: x[i])(x, idx)
+    x = torch.arange(64).to(dtype)
+    idx = torch.tensor([3, 17, 40, 5], dtype=torch.int32)
+    out = torch.compile(lambda x, i: x[i])(x.to("spyre"), idx.to("spyre"))
+    torch.testing.assert_close(out.cpu(), x[idx], atol=0, rtol=0)
 
 
 if __name__ == "__main__":
