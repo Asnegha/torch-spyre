@@ -4882,12 +4882,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # TODO: fp32 per-channel broadcast over a non-stick dim fails in
-        # optimize_restickify ("no mechanism to resolve stick incompatibility");
-        # a plain fp32 x * s.view(1, -1, 1, 1) hits the same error (issue #1377).
         ("test_batch_norm_functional", "test_batch_norm_functional_cpu"): {
             "param_sets": BATCH_NORM_PARAM_SETS,
-            "expect_fail": ["4d_fp32"],
         },
         # TODO: group_norm fails layout propagation with a stick incompatibility
         # (issue #3287).
