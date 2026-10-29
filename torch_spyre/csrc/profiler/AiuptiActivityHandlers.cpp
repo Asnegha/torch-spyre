@@ -18,10 +18,10 @@
 #include <libaiupti/aiupti_runtime_cbid.h>
 
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -56,54 +56,6 @@ class RuntimeTraceActivity : public libkineto::GenericTraceActivity {
 }  // namespace
 
 // =========== Session Private Methods ============= //
-void AiuptiActivityProfilerSession::removeCorrelatedPtiActivities(
-    const libkineto::ITraceActivity* act1) {
-  const auto key = act1->correlationId();
-  const auto& it = correlatedPtiActivities_.find(key);
-  if (it != correlatedPtiActivities_.end()) correlatedPtiActivities_.erase(key);
-  return;
-}
-
-void AiuptiActivityProfilerSession::checkTimestampOrder(
-    const libkineto::ITraceActivity* act1) {
-  const auto& it = correlatedPtiActivities_.find(act1->correlationId());
-  if (it == correlatedPtiActivities_.end()) {
-    correlatedPtiActivities_.insert({act1->correlationId(), act1});
-    return;
-  }
-
-  const libkineto::ITraceActivity* act2 = it->second;
-  if (act2->type() == libkineto::ActivityType::PRIVATEUSE1_RUNTIME)
-    std::swap(act1, act2);
-  if (act1->timestamp() > act2->timestamp()) {
-    std::string err_msg;
-    err_msg += "AIU op timestamp (" + std::to_string(act2->timestamp());
-    err_msg += ") < runtime timestamp (" + std::to_string(act1->timestamp());
-    err_msg += ") by " + std::to_string(act1->timestamp() - act2->timestamp());
-    err_msg += "us Name: " + act2->name();
-    err_msg += " Device: " + std::to_string(act2->deviceId());
-    err_msg += " Queue: " + std::to_string(act2->resourceId());
-    errors_.push_back(err_msg);
-  }
-}
-
-inline bool AiuptiActivityProfilerSession::outOfRange(
-    const libkineto::ITraceActivity& act) {
-  bool out_of_range =
-      act.timestamp() < captureWindowStartTime_ ||
-      (act.timestamp() + act.duration()) > captureWindowEndTime_;
-  if (out_of_range) {
-    std::string err_msg;
-    err_msg += "TraceActivity outside of profiling window: " + act.name();
-    err_msg += " (" + std::to_string(act.timestamp());
-    err_msg += " < " + std::to_string(captureWindowStartTime_);
-    err_msg += " or " + std::to_string(act.timestamp() + act.duration());
-    err_msg += " > " + std::to_string(captureWindowEndTime_);
-    errors_.push_back(err_msg);
-  }
-  return out_of_range;
-}
-
 const libkineto::ITraceActivity*
 AiuptiActivityProfilerSession::linkedCpuActivity(uint64_t externalId) {
   // Kineto's lookup callback currently accepts int32_t. Preserve wider IDs in
@@ -334,6 +286,51 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
   return "Unknown CBID " + std::to_string(cbid);
 }
 
+template <size_t N>
+inline std::string fixedCharField(const char (&field)[N]) {
+  return std::string(field, strnlen(field, N));
+}
+
+// Collective-communication metadata, when the producer set any. Emitted as
+// trace args only, so activity names and grouping are unaffected. The first
+// byte is checked before building a string because most records carry none.
+//
+// Producer contract (libaiupti AIUpti_ActivityCompute/_ActivityMemcpy): the
+// names are fixed char[AIUPTI_COLL_NAME_SIZE] arrays, empty when not set, and
+// coll_bytes is 0 both for a zero-byte transfer and when unknown. flex fills
+// coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
+// all required, so a non-empty coll_algo means coll_bytes was really parsed.
+// On collective records coll_bytes is therefore the number when known
+// (including a real 0) and "" when the label carried no size.
+
+template <class T, class = void>
+struct HasCollFields : std::false_type {};
+template <class T>
+struct HasCollFields<T, std::void_t<decltype(std::declval<T&>().coll_group),
+                                    decltype(std::declval<T&>().coll_algo),
+                                    decltype(std::declval<T&>().coll_bytes)>>
+    : std::true_type {};
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addCollMetadata(trace_activity_type& trace_activity,
+                            const aiupti_activity_type* activity) {
+  if constexpr (HasCollFields<aiupti_activity_type>::value) {
+    if (activity->coll_group[0] != '\0') {
+      trace_activity->addMetadataQuoted("coll_group",
+                                        fixedCharField(activity->coll_group));
+    }
+    if (activity->coll_algo[0] != '\0') {
+      trace_activity->addMetadataQuoted("coll_algo",
+                                        fixedCharField(activity->coll_algo));
+    }
+    if (activity->coll_bytes != 0 || activity->coll_algo[0] != '\0') {
+      trace_activity->addMetadata("coll_bytes", activity->coll_bytes);
+    } else if (activity->coll_group[0] != '\0') {
+      trace_activity->addMetadataQuoted("coll_bytes", "");
+    }
+  }
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
@@ -446,15 +443,6 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
     default:
       break;
   }
-
-  // checkTimestampOrder(&*runtime_activity);
-  // if (outOfRange(*runtime_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*runtime_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   runtime_activity->log(*logger);
 }
 
@@ -487,10 +475,11 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("queued", activity->queued);
   kernel_activity->addMetadata("submitted", activity->submitted);
   kernel_activity->addMetadata("device", kernel_activity->deviceId());
-  kernel_activity->addMetadata("stream", 1);
+  kernel_activity->addMetadata("stream", activity->stream_id);
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
+  addCollMetadata(kernel_activity, activity);
   if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
     kernel_activity->addMetadataQuoted("provenance_key", *key);
     if (const auto ids = spyre::lookupKernelProvenance(*key)) {
@@ -503,15 +492,6 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
 
   recordStream(kernel_activity->device, kernel_activity->resource);
-
-  // checkTimestampOrder(&*kernel_activity);
-  // if (outOfRange(*kernel_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*kernel_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   kernel_activity->log(*logger);
 }
 
@@ -620,6 +600,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
   // AIUpti_ActivityMemcpy does not say whether the record came from a
   // command buffer (real counters) or a standalone flex MEMCPY (always 0;
   // today flex reports every DMA this way), so omit the key when all slots
@@ -628,6 +609,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   if (hasCyclesTs(activity)) {
     memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   }
+  addCollMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
@@ -636,15 +618,6 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   } else {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
   }
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memcpy_activity);
-  // if (outOfRange(*memcpy_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memcpy_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memcpy_activity->log(*logger);
 }
 
@@ -673,8 +646,6 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
         traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_DRIVER,
         fmt::format("Memory ({})",
                     memoryOperationName(activity->memory_operation_type)));
-    // memcpyName(
-    //     activity->memcpy_type, activity->mem_src, activity->mem_dst));
     auto& mem_activity = traceBuffer_.activities.back();
     mem_activity->startTime = activity->start;
     mem_activity->endTime = activity->end;
@@ -698,6 +669,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
                               activity->memory_operation_type);
     mem_activity->addMetadata("bytes", activity->bytes);
     mem_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+    mem_activity->addMetadata("stream", activity->stream_id);
 
     if (mem_activity->resource == getBaseResourceId(activity)) {
       recordMemoryStream(mem_activity->device, mem_activity->resource,
@@ -705,14 +677,6 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     } else {
       recordMemoryStream(mem_activity->device, mem_activity->resource, " ");
     }
-    // checkTimestampOrder(&*mem_activity);
-    // if (outOfRange(*mem_activity)) {
-    //   traceBuffer_.span.opCount -= 1;
-    //   traceBuffer_.gpuOpCount -= 1;
-    //   removeCorrelatedPtiActivities(&*mem_activity);
-    //   traceBuffer_.activities.pop_back();
-    //   return;
-    // }
     mem_activity->log(*logger);
   }
 
@@ -779,6 +743,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   memset_activity->addMetadata("correlation", activity->correlation_id);
   memset_activity->addMetadata("bytes", activity->bytes);
   memset_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memset_activity->addMetadata("stream", activity->stream_id);
 
   if (memset_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memset_activity->device, memset_activity->resource,
@@ -786,16 +751,6 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   } else {
     recordMemoryStream(memset_activity->device, memset_activity->resource, " ");
   }
-
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memset_activity);
-  // if (outOfRange(*memset_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memset_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memset_activity->log(*logger);
 }
 
